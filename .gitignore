@@ -1,0 +1,23 @@
+# Виртуальное окружение
+.venv/
+venv/
+env/
+
+# Python кэш
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Секреты и конфигурации
+.env
+
+# Данные и базы
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/vector_db/*
+!data/vector_db/.gitkeep
+
+# Системные файлы
+.DS_Store

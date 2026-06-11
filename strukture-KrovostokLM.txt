@@ -1,0 +1,15 @@
+krovostok_lm/
+├── data/
+│   ├── raw/                 # Сырые .txt файлы с текстами песен
+│   ├── processed/           # Готовые датасеты (.csv, .parquet)
+│   └── vector_db/           # Директория для индексов FAISS/ChromaDB
+├── src/
+│   ├── __init__.py
+│   ├── data_prep.py         # Скрипт парсинга и очистки
+│   ├── vectorize.py         # Скрипт создания эмбеддингов
+│   ├── core.py              # LLM + HyDE логика (RAG)
+│   └── bot.py               # Точка входа для Telegram (aiogram)
+├── .env                     # API ключи (LLM, Telegram) - НЕ КОММИТИТЬ
+├── .gitignore               # Исключения для Git
+├── requirements.txt         # Зависимости
+└── README.md                # Описание проекта
