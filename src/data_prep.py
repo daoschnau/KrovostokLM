@@ -7,21 +7,20 @@ def clean_line(line: str) -> str:
     """Базовая очистка строки от лишних пробелов и спецсимволов."""
     return " ".join(line.split())
 
-def chunk_text(text: str, lines_per_chunk: int = 4) -> list[str]:
-    """
-    Разбивает сырой текст на смысловые блоки (по умолчанию - четверостишия).
-    Игнорирует пустые строки.
-    """
-    # Очищаем строки и убираем пустые
-    lines = [clean_line(line) for line in text.split('\n') if line.strip()]
+def chunk_text(text: str, window_size: int = 2) -> list[str]:
+    """Максимально честный Sliding Window."""
+    # Убираем фильтр длины, чтобы не терять короткие, но важные строки
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
     
     chunks = []
-    # Итерируемся с шагом lines_per_chunk
-    for i in range(0, len(lines), lines_per_chunk):
-        chunk_lines = lines[i:i + lines_per_chunk]
-        # Объединяем строки в один смысловой блок, сохраняя переносы для форматирования
-        chunk_text = " \n ".join(chunk_lines)
-        chunks.append(chunk_text)
+    # Если строк меньше окна, берем всё что есть
+    if len(lines) <= window_size:
+        return [" \n ".join(lines)] if lines else []
+    
+    # Теперь точно пройдем по каждой возможной паре
+    for i in range(len(lines) - window_size + 1):
+        chunk = " \n ".join(lines[i:i + window_size])
+        chunks.append(chunk)
         
     return chunks
 
@@ -56,8 +55,8 @@ def clean_line(line: str) -> str:
     """Базовая очистка строки от лишних пробелов и спецсимволов."""
     return " ".join(line.split())
 
-def chunk_text(text: str, lines_per_chunk: int = 4) -> list[str]:
-    """Разбивает текст на смысловые блоки."""
+def chunk_text(text: str, lines_per_chunk: int = 2) -> list[str]:
+    """Разбивает текст на смысловые блоки (двустишия)."""
     lines = [clean_line(line) for line in text.split('\n') if line.strip()]
     chunks = []
     for i in range(0, len(lines), lines_per_chunk):
