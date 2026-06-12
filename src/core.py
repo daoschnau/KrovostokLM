@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 import anthropic
 import chromadb
 from chromadb.utils import embedding_functions
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -51,6 +52,7 @@ def generate_psychologist_advice(user_query: str) -> str:
         print(f"[ОШИБКА HyDE] {e}")
         return "Всё тлен, брат. Просто терпи."
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def find_top_quotes(advice_text: str, n=20) -> list:
     """Шаг 2: Достаем ТОП-20 похожих цитат из ChromaDB для расширения выборки."""
     # Вручную превращаем текст в вектор через HuggingFace
@@ -58,7 +60,7 @@ def find_top_quotes(advice_text: str, n=20) -> list:
     
     # Ищем по готовому вектору, обходя внутренние валидаторы
     results = collection.query(query_embeddings=query_vector, n_results=n)
-    
+
     quotes = []
     if results['documents']:
         for i in range(len(results['documents'][0])):
