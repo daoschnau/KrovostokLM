@@ -21,10 +21,8 @@ hf_ef = embedding_functions.HuggingFaceEmbeddingFunction(
 )
 
 chroma_client = chromadb.PersistentClient(path=str(db_path))
-collection = chroma_client.get_collection(
-    name="krovostok_quotes",
-    embedding_function=hf_ef
-)
+# Убираем жесткую привязку функции, чтобы не бесить ChromaDB
+collection = chroma_client.get_collection(name="krovostok_quotes")
 
 def generate_psychologist_advice(user_query: str) -> str:
     """Шаг 1: HyDE. Чистая выжимка сути без пересказа ситуации пользователя."""
@@ -55,7 +53,12 @@ def generate_psychologist_advice(user_query: str) -> str:
 
 def find_top_quotes(advice_text: str, n=20) -> list:
     """Шаг 2: Достаем ТОП-20 похожих цитат из ChromaDB для расширения выборки."""
-    results = collection.query(query_texts=[advice_text], n_results=n)
+    # Вручную превращаем текст в вектор через HuggingFace
+    query_vector = hf_ef([advice_text])
+    
+    # Ищем по готовому вектору, обходя внутренние валидаторы
+    results = collection.query(query_embeddings=query_vector, n_results=n)
+    
     quotes = []
     if results['documents']:
         for i in range(len(results['documents'][0])):
