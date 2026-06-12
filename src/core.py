@@ -14,14 +14,16 @@ llm_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 base_dir = Path(__file__).resolve().parent.parent
 db_path = base_dir / "data" / "vector_db"
 
-sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+# Используем удаленное API вместо загрузки модели в RAM
+hf_ef = embedding_functions.HuggingFaceEmbeddingFunction(
+    api_key=os.getenv("HF_TOKEN"),
     model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 )
 
 chroma_client = chromadb.PersistentClient(path=str(db_path))
 collection = chroma_client.get_collection(
     name="krovostok_quotes",
-    embedding_function=sentence_transformer_ef
+    embedding_function=hf_ef
 )
 
 def generate_psychologist_advice(user_query: str) -> str:
