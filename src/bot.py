@@ -1,5 +1,6 @@
 import os
 import asyncio
+import traceback
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
@@ -53,6 +54,7 @@ async def text_handler(message: types.Message) -> None:
         
     except Exception as e:
         print(f"[ОШИБКА БОТА] {e}")
+        traceback.print_exc()
         await processing_msg.edit_text("Что-то пошло не так. База временно недоступна.")
 
 async def main() -> None:

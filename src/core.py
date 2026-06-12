@@ -7,7 +7,6 @@ import chromadb
 from chromadb.utils import embedding_functions
 from tenacity import retry, stop_after_attempt, wait_exponential
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -19,19 +18,25 @@ db_path = base_dir / "data" / "vector_db"
 
 # Используем удаленное API вместо загрузки модели в RAM
 def get_embedding_robust(text: str) -> list:
-    """Железобетонный коннектор к Hugging Face с ожиданием загрузки модели."""
-    API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    headers = {"Authorization": f"Bearer {os.getenv('HF_TOKEN')}"}
-    
-    # Ключевая фишка: заставляем API ждать загрузки модели, а не отбивать 503 ошибку
-    payload = {
-        "inputs": [text],
-        "options": {"wait_for_model": True}
-    }
-    
-    response = requests.post(API_URL, headers=headers, json=payload, timeout=60)
-    response.raise_for_status()
-    
+    """Получает эмбеддинг через HF Inference API.
+
+    Старый домен api-inference.huggingface.co отключён (ConnectionError),
+    поэтому ходим через актуальный router.huggingface.co.
+    """
+    api_url = (
+        "https://router.huggingface.co/hf-inference/models/"
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2/pipeline/feature-extraction"
+    )
+    token = os.getenv("HF_TOKEN")
+    if not token:
+        raise RuntimeError("HF_TOKEN не задан в переменных окружения")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    response = requests.post(api_url, headers=headers, json={"inputs": [text]}, timeout=60)
+    if response.status_code != 200:
+        # Кладём тело ответа в ошибку, чтобы в логах была реальная причина, а не голый RetryError
+        raise RuntimeError(f"HF API вернул {response.status_code}: {response.text[:300]}")
+
     # Возвращаем сам вектор (он приходит как список списков)
     return response.json()
 
@@ -66,7 +71,7 @@ def generate_psychologist_advice(user_query: str) -> str:
         print(f"[ОШИБКА HyDE] {e}")
         return "Всё тлен, брат. Просто терпи."
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=15))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=15), reraise=True)
 def find_top_quotes(advice_text: str, n=20) -> list:
     """Шаг 2: Достаем ТОП-20 похожих цитат из ChromaDB для расширения выборки."""
     # Получаем вектор через нашу новую функцию
@@ -121,10 +126,6 @@ def rerank_quotes(user_query: str, quotes: list) -> dict:
                 if q['id'] == best_id:
                     return q
                     
-        return quotes[0]
-        
-    except Exception as e:
-        print(f"[ОШИБКА Rerank] {e}")
         return quotes[0]
         
     except Exception as e:
