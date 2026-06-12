@@ -6,6 +6,8 @@ import anthropic
 import chromadb
 from chromadb.utils import embedding_functions
 from tenacity import retry, stop_after_attempt, wait_exponential
+import requests
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -16,9 +18,22 @@ base_dir = Path(__file__).resolve().parent.parent
 db_path = base_dir / "data" / "vector_db"
 
 # Используем удаленное API вместо загрузки модели в RAM
-hf_ef = embedding_functions.HuggingFaceEmbeddingFunction(
-    api_key=os.getenv("HF_TOKEN"),
-    model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+def get_embedding_robust(text: str) -> list:
+    """Железобетонный коннектор к Hugging Face с ожиданием загрузки модели."""
+    API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    headers = {"Authorization": f"Bearer {os.getenv('HF_TOKEN')}"}
+    
+    # Ключевая фишка: заставляем API ждать загрузки модели, а не отбивать 503 ошибку
+    payload = {
+        "inputs": [text],
+        "options": {"wait_for_model": True}
+    }
+    
+    response = requests.post(API_URL, headers=headers, json=payload, timeout=60)
+    response.raise_for_status()
+    
+    # Возвращаем сам вектор (он приходит как список списков)
+    return response.json()
 )
 
 chroma_client = chromadb.PersistentClient(path=str(db_path))
@@ -52,15 +67,15 @@ def generate_psychologist_advice(user_query: str) -> str:
         print(f"[ОШИБКА HyDE] {e}")
         return "Всё тлен, брат. Просто терпи."
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=15))
 def find_top_quotes(advice_text: str, n=20) -> list:
     """Шаг 2: Достаем ТОП-20 похожих цитат из ChromaDB для расширения выборки."""
-    # Вручную превращаем текст в вектор через HuggingFace
-    query_vector = hf_ef([advice_text])
+    # Получаем вектор через нашу новую функцию
+    query_vector = get_embedding_robust(advice_text)
     
-    # Ищем по готовому вектору, обходя внутренние валидаторы
+    # Ищем по готовому вектору
     results = collection.query(query_embeddings=query_vector, n_results=n)
-
+    
     quotes = []
     if results['documents']:
         for i in range(len(results['documents'][0])):
