@@ -34,7 +34,6 @@ def get_embedding_robust(text: str) -> list:
     
     # Возвращаем сам вектор (он приходит как список списков)
     return response.json()
-)
 
 chroma_client = chromadb.PersistentClient(path=str(db_path))
 # Убираем жесткую привязку функции, чтобы не бесить ChromaDB
