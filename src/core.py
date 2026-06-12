@@ -44,7 +44,7 @@ chroma_client = chromadb.PersistentClient(path=str(db_path))
 # Убираем жесткую привязку функции, чтобы не бесить ChromaDB
 collection = chroma_client.get_collection(name="krovostok_quotes")
 
-def generate_psychologist_advice(user_query: str) -> str:
+def generate_psychologist_advice(user_query: str, history: list | None = None) -> str:
     """Шаг 1: HyDE. Чистая выжимка сути без пересказа ситуации пользователя."""
     system_prompt = (
         "Ты — старый, повидавший дерьма авторитетный текстовик группы «Кровосток». "
@@ -56,15 +56,19 @@ def generate_psychologist_advice(user_query: str) -> str:
         "3. Используй мрачный фатализм, уличную философию и метафоры Кровостока (безысходность, физиология, криминал, но с внутренним стержнем).\n"
         "4. Объем: строго 1-2 коротких предложения. Только концентрат смысла.\n"
         "\n"
-        "Пример правильного ответа: 'Гниль съедает слабых, а сильные просто молча жуют стекло. Выплюнь кровь и иди дальше.'"
+        "Пример правильного ответа: 'Гниль съедает слабых, а сильные просто молча жуют стекло. Выплюнь кровь и иди дальше.'\n"
+        "\n"
+        "Если в диалоге есть предыдущие сообщения — используй их только как фон, чтобы понять ситуацию, "
+        "но отвечай строго на последнее сообщение."
     )
+    messages = list(history or []) + [{"role": "user", "content": user_query}]
     try:
         response = llm_client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=100, # Урезали лимит, чтобы он физически не мог лить воду
             temperature=0.8,
             system=system_prompt,
-            messages=[{"role": "user", "content": user_query}]
+            messages=messages
         )
         return response.content[0].text.strip()
     except Exception as e:
@@ -90,14 +94,24 @@ def find_top_quotes(advice_text: str, n=20) -> list:
             })
     return quotes
 
-def rerank_quotes(user_query: str, quotes: list) -> dict:
+def rerank_quotes(user_query: str, quotes: list, history: list | None = None) -> dict:
     """Шаг 3: Reranking. Клод фильтрует мусор и выбирает ИДЕАЛЬНУЮ цитату из ТОП-20."""
     if not quotes:
         return {"quote": "База пуста.", "track": "Unknown"}
 
     quotes_text = "\n\n".join([f"[{q['id']}] {q['quote']} (Трек: {q['track']})" for q in quotes])
-    
+
+    # Короткий контекст беседы, чтобы реранкер понимал реплики вроде "и что мне теперь делать?"
+    context_block = ""
+    if history:
+        lines = [
+            f"{'Пользователь' if m['role'] == 'user' else 'Бот'}: {m['content']}"
+            for m in history
+        ]
+        context_block = "Предыдущие реплики диалога (только для понимания контекста):\n" + "\n".join(lines) + "\n\n"
+
     prompt = (
+        f"{context_block}"
         f"Ситуация пользователя: {user_query}\n\n"
         f"Кандидаты (цитаты группы Кровосток):\n{quotes_text}\n\n"
         "Твоя задача — выбрать ровно ОДНУ цитату, которая станет идеальным ироничным или суровым "
@@ -132,18 +146,21 @@ def rerank_quotes(user_query: str, quotes: list) -> dict:
         print(f"[ОШИБКА Rerank] {e}")
         return quotes[0]
 
-def process_user_request(user_query: str) -> dict:
-    """Главная функция пайплайна: HyDE -> Vector Search -> Rerank"""
+def process_user_request(user_query: str, history: list | None = None) -> dict:
+    """Главная функция пайплайна: HyDE -> Vector Search -> Rerank.
+
+    history — последние реплики диалога в формате [{"role": "user"|"assistant", "content": str}, ...]
+    """
     print(f"\n[ЗАПРОС ПОЛЬЗОВАТЕЛЯ]: {user_query}")
-    
-    advice = generate_psychologist_advice(user_query)
+
+    advice = generate_psychologist_advice(user_query, history)
     print(f"\n[СОВЕТ ПСИХОЛОГА (CLAUDE)]: {advice}")
-    
+
     # Ищем топ-10 кандидатов
     top_quotes = find_top_quotes(advice, n=10)
-    
+
     # Выбираем лучшую цитату
-    result = rerank_quotes(user_query, top_quotes)
+    result = rerank_quotes(user_query, top_quotes, history)
     print(f"\n[ЦИТАТА КРОВОСТОКА]:\n{result['quote']}\n(Трек: {result['track']})\n")
     
     return result

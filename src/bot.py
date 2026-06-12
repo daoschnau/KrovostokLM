@@ -1,6 +1,7 @@
 import os
 import asyncio
 import traceback
+from collections import defaultdict, deque
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
@@ -18,6 +19,10 @@ TOKEN = os.getenv("TG_BOT_TOKEN")
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
+# Память диалогов: на каждый чат храним последние 3 пары "вопрос - ответ".
+# Живёт в оперативке, при рестарте сервиса обнуляется — для эффекта беседы этого достаточно.
+chat_histories = defaultdict(lambda: deque(maxlen=6))
+
 @dp.message(CommandStart())
 async def command_start_handler(message: types.Message) -> None:
     """Обработчик команды /start"""
@@ -27,6 +32,8 @@ async def command_start_handler(message: types.Message) -> None:
         "идеальную цитату из текстов Шило и компании.\n\n"
         "<i>Пиши как есть, без купюр.</i>"
     )
+    # /start начинает разговор с чистого листа
+    chat_histories.pop(message.chat.id, None)
     await message.answer(welcome_text)
 
 @dp.message()
@@ -38,10 +45,16 @@ async def text_handler(message: types.Message) -> None:
     processing_msg = await message.answer("<i>Анализирую ситуацию...</i>")
     
     try:
+        history = list(chat_histories[message.chat.id])
+
         # Поскольку наша функция из ядра синхронная, запускаем её в отдельном потоке,
         # чтобы не блокировать асинхронный цикл (event loop) Telegram-бота
-        result = await asyncio.to_thread(process_user_request, user_text)
-        
+        result = await asyncio.to_thread(process_user_request, user_text, history)
+
+        # Запоминаем пару "вопрос - ответ" для следующих сообщений
+        chat_histories[message.chat.id].append({"role": "user", "content": user_text})
+        chat_histories[message.chat.id].append({"role": "assistant", "content": result["quote"]})
+
         # Формируем красивый ответ
         response_text = (
             f"💬 <b>Цитата:</b>\n{result['quote']}\n\n"
