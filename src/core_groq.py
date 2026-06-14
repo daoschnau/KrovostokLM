@@ -6,8 +6,10 @@
               Тон подстраивается под валентность запроса (позитив/негатив),
               чтобы достижения не получали мрачных гипотез.
   2. Поиск  — гипотеза векторизуется локальным e5, ChromaDB отдаёт топ-N.
-  3. Rerank — Groq выбирает одну цитату, следя за знаком эмоции и избегая
-              универсальных «магнит-цитат».
+  3. Rerank — Groq выбирает одну цитату, следя за знаком эмоции, мягкостью на
+              горе, трезвостью и избегая универсальных «магнит-цитат».
+  +  Анти-магнит — на уровне сессии не повторяем недавно выданные треки
+              (в Telegram сессия = chat_id), чтобы один трек не липнул ко всему.
 
 УСТОЙЧИВОСТЬ (для публичного бота — главное требование):
   Groq free tier ограничен дневным бюджетом токенов (TPD, per-model). Когда
@@ -27,6 +29,7 @@ import re
 import sys
 import time
 import threading
+from collections import deque
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -42,6 +45,10 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 USE_HYDE = os.getenv("USE_HYDE", "true").lower() not in {"false", "0", "no"}
 RATE_LIMIT_COOLDOWN = int(os.getenv("GROQ_COOLDOWN_SEC", "120"))
 
+# Анти-магнит: сколько последних выданных треков помним на сессию, чтобы не
+# повторять один и тот же трек подряд (в Telegram сессия = chat_id). 0 — выключить.
+RECENT_TRACKS_MEMORY = int(os.getenv("GROQ_RECENT_TRACKS", "5"))
+
 # Бюджет токенов — главный пожиратель это промпт реранкера, поэтому пул маленький.
 N_CANDIDATES = 12
 
@@ -49,6 +56,7 @@ _client = None
 _tokens_used = 0
 _groq_disabled_until = 0.0  # пока time.time() < этого — Groq не дёргаем (cooldown)
 _cache = {}                 # нормализованный запрос -> результат
+_recent_by_session = {}     # session_id -> deque недавно выданных треков
 _lock = threading.Lock()
 
 
@@ -91,6 +99,25 @@ def _trip_cooldown() -> None:
 
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _recent_tracks(session_id: str) -> set:
+    """Треки, недавно выданные в этой сессии (для анти-магнит фильтра)."""
+    with _lock:
+        dq = _recent_by_session.get(session_id)
+        return set(dq) if dq else set()
+
+
+def _remember_track(session_id: str, track: str) -> None:
+    """Запоминает выданный трек в скользящем окне сессии."""
+    if RECENT_TRACKS_MEMORY <= 0:
+        return
+    with _lock:
+        dq = _recent_by_session.get(session_id)
+        if dq is None:
+            dq = deque(maxlen=RECENT_TRACKS_MEMORY)
+            _recent_by_session[session_id] = dq
+        dq.append(track)
 
 
 def _classify_valence(user_query: str) -> str:
@@ -174,9 +201,13 @@ def rerank_quotes(user_query: str, candidates: list) -> dict | None:
         "1. ЗНАК ЭМОЦИИ. Если ситуация позитивная (достижение, гордость, стойкость) — "
         "НЕ бери цитаты про смерть, боль, наркоту, безысходность. Тон цитаты должен "
         "совпадать со знаком ситуации.\n"
-        "2. НЕТ УНИВЕРСАЛИЯМ — избегай абстрактных строк, подходящих к чему угодно. "
+        "2. ТРЕЗВОСТЬ. Для ситуаций про отказ от вредного (бросил пить/курить, трезвость, "
+        "воздержание) НЕ выбирай цитаты, прославляющие употребление алкоголя или наркотиков.\n"
+        "3. ГОРЕ. Для запросов про смерть, утрату, похороны близких выбирай цитату скорее "
+        "тихую и печальную, чем шок-комичную или абсурдную.\n"
+        "4. НЕТ УНИВЕРСАЛИЯМ — избегай абстрактных строк, подходящих к чему угодно. "
         "Цепляй конкретную деталь ситуации.\n"
-        "3. Игнорируй обрывки без законченной мысли.\n\n"
+        "5. Игнорируй обрывки без законченной мысли.\n\n"
         "Ответь строго: ЗНАК: <позитив/негатив>  ОТВЕТ: [номер]"
     )
     try:
@@ -205,9 +236,12 @@ def rerank_quotes(user_query: str, candidates: list) -> dict | None:
         return None
 
 
-def find_quote(user_message: str) -> dict:
+def find_quote(user_message: str, session_id: str = "_global") -> dict:
     """Главный пайплайн. Никогда не бросает исключений: при любом сбое Groq
     деградирует в чистый e5-retrieval.
+
+    session_id — изолирует анти-магнит память (в Telegram передаём chat_id,
+    чтобы цитаты одного юзера не влияли на других). По умолчанию общая сессия.
 
     Drop-in замена core_hf.find_quote: возврат {quote, track}.
     """
@@ -231,6 +265,16 @@ def find_quote(user_message: str) -> dict:
         n=N_CANDIDATES,
     )
     valid = [c for c in candidates if c["valid"]] or candidates
+
+    # Анти-магнит: выкидываем недавно показанные треки, если остаётся из чего
+    # выбирать (>= 3 кандидата), иначе оставляем как есть — лучше повтор, чем пусто.
+    recent = _recent_tracks(session_id)
+    if recent:
+        fresh = [c for c in valid if c["track"] not in recent]
+        if len(fresh) >= 3:
+            valid = fresh
+            print(f"[GROQ] Анти-магнит: исключены треки {recent}")
+
     for new_id, c in enumerate(valid):
         c["id"] = new_id
 
@@ -243,6 +287,7 @@ def find_quote(user_message: str) -> dict:
     else:
         print(f"[GROQ] Выбрана: {result['quote'][:60]}")
 
+    _remember_track(session_id, result["track"])
     with _lock:
         _cache[key] = result
     return result
