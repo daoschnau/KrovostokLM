@@ -3,3 +3,7 @@
 chromadb==1.5.9
 sentence-transformers>=2.7,<3.0
 python-dotenv==1.2.1
+
+# Нужны для пересборки базы (data_prep.py + vectorize.py)
+pandas
+pyarrow
