@@ -1,67 +1,71 @@
 import pandas as pd
 import chromadb
 from pathlib import Path
-from chromadb.utils import embedding_functions
+from sentence_transformers import SentenceTransformer
+
+EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
+COLLECTION_NAME = "krovostok_quotes"
+
 
 def main():
-    # Настраиваем пути
     base_dir = Path(__file__).resolve().parent.parent
     data_path = base_dir / "data" / "processed" / "dataset.parquet"
     db_path = base_dir / "data" / "vector_db"
 
     if not data_path.exists():
-        print(f"[ОШИБКА] Файл {data_path} не найден. Сначала запустите data_prep.py")
+        print(f"[ОШИБКА] {data_path} не найден. Сначала запустите data_prep.py")
         return
 
     print("Читаем датасет...")
     df = pd.read_parquet(data_path)
+    print(f"Чанков к векторизации: {len(df)}")
 
-    print("Инициализируем локальную модель эмбеддингов (при первом запуске она скачается ~400MB)...")
-    # Используем мультиязычную модель без цензуры
-    sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    print(f"Загружаем модель {EMBEDDING_MODEL}")
+    print("(при первом запуске скачается ~560 MB)")
+    model = SentenceTransformer(EMBEDDING_MODEL)
+
+    # e5 требует prefix 'passage:' для документов при индексации
+    print("Векторизуем тексты...")
+    texts = ["passage: " + t for t in df["text"]]
+    embeddings = model.encode(
+        texts,
+        batch_size=32,
+        normalize_embeddings=True,
+        show_progress_bar=True,
     )
 
-    print(f"Подключаемся к ChromaDB по пути: {db_path}")
+    print(f"Подключаемся к ChromaDB: {db_path}")
     client = chromadb.PersistentClient(path=str(db_path))
 
-    collection_name = "krovostok_quotes"
-
-    # Удаляем старую коллекцию, чтобы не оставалось удалённых чанков-зомби.
-    # upsert обновляет существующие записи, но НЕ удаляет те, которых больше нет
-    # в parquet — отсюда дубли в результатах поиска.
+    # Чистая пересборка: upsert не удаляет чанки-зомби при изменении модели
     try:
-        client.delete_collection(name=collection_name)
-        print(f"Удалена старая коллекция '{collection_name}' (чистая пересборка)")
+        client.delete_collection(name=COLLECTION_NAME)
+        print("Удалена старая коллекция")
     except Exception:
         pass
 
-    collection = client.create_collection(
-        name=collection_name,
-        embedding_function=sentence_transformer_ef
-    )
+    # Без embedding_function — эмбеддинги уже готовы, ChromaDB хранит их как есть
+    collection = client.create_collection(name=COLLECTION_NAME)
 
+    total = len(df)
     batch_size = 100
-    total_batches = (len(df) // batch_size) + 1
+    print(f"Загружаем {total} записей в базу...")
 
-    print(f"Начинаем векторизацию и загрузку {len(df)} записей в базу...")
-
-    for i in range(total_batches):
-        start_idx = i * batch_size
-        end_idx = start_idx + batch_size
-        batch_df = df.iloc[start_idx:end_idx]
-
-        if batch_df.empty:
-            break
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        batch_df = df.iloc[start:end]
+        batch_emb = embeddings[start:end]
 
         collection.add(
+            embeddings=batch_emb.tolist(),
             documents=batch_df["text"].tolist(),
-            metadatas=[{"track_name": track} for track in batch_df["track_name"].tolist()],
-            ids=batch_df["chunk_id"].tolist()
+            metadatas=[{"track_name": t} for t in batch_df["track_name"]],
+            ids=batch_df["chunk_id"].tolist(),
         )
-        print(f"  -> Обработан батч {i+1}/{total_batches}")
+        print(f"  -> {end}/{total}")
 
-    print("✅ Векторизация успешно завершена! База ChromaDB готова.")
+    print("✅ Векторизация завершена. База ChromaDB готова.")
+
 
 if __name__ == "__main__":
     main()

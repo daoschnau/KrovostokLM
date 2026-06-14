@@ -2,17 +2,20 @@
 Версия пайплайна без Claude.
 
 Вместо HyDE + LLM-реранкинга:
-  1. Запрос пользователя векторизуется напрямую той же моделью, что использовалась при индексации
-  2. ChromaDB возвращает топ-20 ближайших цитат
-  3. Эвристический фильтр убирает обрывки и буквальные совпадения
+  1. Запрос пользователя векторизуется с префиксом 'query:' (требование e5)
+  2. ChromaDB возвращает топ-30 ближайших цитат (cosine similarity)
+  3. Эвристический фильтр убирает обрывки, запятые-хвосты и буквальные совпадения
   4. Возвращается лучший оставшийся результат
+
+Эмбеддер: intfloat/multilingual-e5-large (~560 MB, лучше для русского, чем MiniLM).
+Документы в базе проиндексированы с префиксом 'passage:' (см. vectorize.py).
 """
 import re
 from pathlib import Path
+from sentence_transformers import SentenceTransformer
 import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
-EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
 COLLECTION_NAME = "krovostok_quotes"
 N_CANDIDATES = 30
 
@@ -25,34 +28,39 @@ _PREPOSITIONS = {
 base_dir = Path(__file__).resolve().parent.parent
 db_path = base_dir / "data" / "vector_db"
 
+_model = None
 _collection = None
+
+
+def _get_model() -> SentenceTransformer:
+    global _model
+    if _model is None:
+        print(f"[HF-DIRECT] Загрузка модели {EMBEDDING_MODEL}...")
+        _model = SentenceTransformer(EMBEDDING_MODEL)
+    return _model
 
 
 def _get_collection():
     global _collection
     if _collection is None:
-        ef = SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL)
         client = chromadb.PersistentClient(path=str(db_path))
-        _collection = client.get_collection(name=COLLECTION_NAME, embedding_function=ef)
+        # Без embedding_function: эмбеддинги хранятся явно, мы сами их вычисляем
+        _collection = client.get_collection(name=COLLECTION_NAME)
     return _collection
 
 
 def _is_valid(text: str, user_query: str) -> bool:
     text = text.strip()
 
-    # Слишком короткий фрагмент
-    if len(text) < 12:
-        return False
-
-    # Слишком мало слов — не тянет на цитату
-    if len(text.split()) < 6:
+    # Слишком короткий или малословный фрагмент
+    if len(text) < 12 or len(text.split()) < 6:
         return False
 
     # Заканчивается запятой или двоеточием — фраза не завершена
     if text.rstrip()[-1] in {",", ":"}:
         return False
 
-    # Артефакт скрапера: пробел-точки-пробел внутри текста указывает на обрыв оригинала
+    # Артефакт скрапера: «слово ... слово» — обрыв оригинала
     if re.search(r"\s\.\.\.\s", text):
         return False
 
@@ -77,19 +85,25 @@ def find_quote(user_message: str) -> dict:
 
     Возвращает dict с ключами 'quote' и 'track'.
     """
+    model = _get_model()
     collection = _get_collection()
 
-    results = collection.query(query_texts=[user_message], n_results=N_CANDIDATES)
+    # e5 требует prefix 'query:' для поискового запроса
+    query_embedding = model.encode(
+        "query: " + user_message,
+        normalize_embeddings=True,
+    ).tolist()
+
+    results = collection.query(query_embeddings=[query_embedding], n_results=N_CANDIDATES)
     docs = results["documents"][0]
     metas = results["metadatas"][0]
     distances = results["distances"][0]
 
     print(f"\n[HF-DIRECT] Запрос: {user_message}")
-    print(f"[HF-DIRECT] Топ-3 из ChromaDB (расстояния):")
+    print("[HF-DIRECT] Топ-3 из ChromaDB (расстояния):")
     for i in range(min(3, len(docs))):
         print(f"  [{i}] dist={distances[i]:.4f} | {docs[i][:60]}...")
 
-    # Берём первую цитату, прошедшую фильтр
     for doc, meta in zip(docs, metas):
         if _is_valid(doc, user_message):
             print(f"[HF-DIRECT] Выбрана: {doc[:80]}")
