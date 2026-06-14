@@ -1,0 +1,12 @@
+# Зависимости для локального тестирования пайплайна
+# Установка: pip install -r requirements-local.txt
+chromadb==1.5.9
+sentence-transformers>=3.0
+python-dotenv==1.2.1
+
+# LLM-реранкер на Groq (бэкенд groq в core_groq.py / batch_test.py)
+groq>=0.11
+
+# Нужны для пересборки базы (data_prep.py + vectorize.py)
+pandas
+pyarrow
