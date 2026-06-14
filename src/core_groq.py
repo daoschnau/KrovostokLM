@@ -1,21 +1,25 @@
 """
 Пайплайн с LLM-прокладкой на Groq (бесплатный tier, открытая модель).
 
-Архитектура (как в старом core.py, но Claude → Groq, эмбеддинг → локальный e5):
-  1. HyDE  — Groq генерирует короткую «мораль в духе Кровостока» по ситуации.
-  2. Поиск — гипотеза векторизуется локальным e5, ChromaDB отдаёт топ-N кандидатов.
-  3. Rerank — Groq выбирает из кандидатов одну цитату, чей вайб лучше ложится
-              на ситуацию (отсекает синтаксический мусор и буквальные совпадения).
+Архитектура (гибридный поиск):
+  1. HyDE    — Groq генерирует короткую «мораль в духе Кровостока» по ситуации.
+  2. Поиск   — два параллельных запроса к ChromaDB:
+               • по HyDE-гипотезе (семантически далёкие, но меткие цитаты)
+               • по сырому запросу пользователя (конкретные детали ситуации)
+               Пулы объединяются и дедупируются → ~25 уникальных кандидатов.
+  3. Rerank  — Groq выбирает одну цитату, следя за валентностью и избегая
+               универсальных «магнит-цитат».
 
-Зачем LLM-слой: цитаты Кровостока абсурдистские, чистый retrieval цепляется
-за поверхностные совпадения слов. Реранкер оценивает уместность вайба, а сама
-цитата остаётся настоящей (из базы) — модель ничего не сочиняет.
+Зачем гибридный поиск: HyDE уходит семантически дальше и находит жемчужины,
+которых raw не видит (#11, #14, #15, #20, #24 по тестовым прогонам). Raw держит
+конкретные детали ситуации (#12 «начну с аптеки», #16 «качался/потел», #21
+«малышка ходить не сможет»). Реранкер делает финальный выбор из объединённого пула.
 
 Модель: llama-3.3-70b-versatile (Groq free tier, сильна в русском).
 Ключ:   GROQ_API_KEY в .env
 
-HyDE можно отключить (USE_HYDE=false в .env) — тогда поиск идёт по сырому
-запросу пользователя, остаётся только реранкинг.
+HyDE можно отключить (USE_HYDE=false в .env) — тогда поиск идёт только по сырому
+запросу пользователя.
 """
 import os
 import re
@@ -25,7 +29,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 from groq import Groq
 
-# Позволяет запускать/импортировать без установки пакета
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from core_hf import retrieve_candidates, EMBEDDING_MODEL  # noqa: E402
@@ -34,7 +37,7 @@ load_dotenv()
 
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 USE_HYDE = os.getenv("USE_HYDE", "true").lower() not in {"false", "0", "no"}
-N_CANDIDATES = 20
+N_PER_ARM = 15  # кандидатов от каждого плеча поиска
 
 _client = None
 
@@ -52,18 +55,54 @@ def _get_client() -> Groq:
     return _client
 
 
+def _classify_valence(user_query: str) -> str:
+    """Быстрая лексическая эвристика: позитив или негатив.
+
+    Не вызывает LLM — используется внутри generate_hyde, чтобы направить
+    тон гипотезы и избежать мрачных HyDE для позитивных запросов.
+    """
+    positive_markers = {
+        "горжусь", "победил", "добежал", "подтянулся", "купил", "накопил",
+        "сделал", "достиг", "бросил пить", "держусь", "начал", "впервые",
+        "рад", "счастлив", "удалось", "получилось", "наконец", "цель",
+        "написал", "запустил", "заработал", "выиграл",
+    }
+    query_lower = user_query.lower()
+    if any(m in query_lower for m in positive_markers):
+        return "позитив"
+    return "негатив"
+
+
 def generate_hyde(user_query: str) -> str:
-    """Шаг 1 (HyDE): суровая мораль в духе Кровостока — концентрат смысла без
-    пересказа ситуации. Её вектор ближе к нужным цитатам, чем сырой запрос."""
+    """Шаг 1 (HyDE): суровая или дерзкая мораль в духе Кровостока.
+
+    Тон регулируется валентностью запроса: позитивные запросы получают
+    дерзкую гипотезу, чтобы не тащить мрачный кластер.
+    """
+    valence = _classify_valence(user_query)
+
+    if valence == "позитив":
+        tone_instruction = (
+            "Запрос несёт ПОЗИТИВНЫЙ знак (достижение, гордость, стойкость, победа). "
+            "Выдай дерзкое, кайфовое, мрачновато-торжествующее напутствие — кровосток-style. "
+            "НЕ используй образы смерти, боли, безысходности, гниения."
+        )
+    else:
+        tone_instruction = (
+            "Выдай суровую философскую мораль — мрачный фатализм, уличная философия, "
+            "метафоры Кровостока (безысходность, физиология, криминал, но с внутренним стержнем)."
+        )
+
     system_prompt = (
-        "Ты — старый, повидавший дерьма текстовик группы «Кровосток». "
-        "Выдай суровую философскую мораль или жёсткое напутствие в ответ на боль пользователя.\n\n"
-        "ПРАВИЛА:\n"
-        "1. ЗАПРЕЩЕНО пересказывать или комментировать ситуацию пользователя. Не используй слова из его запроса. Никаких вступлений вроде 'Слушай, брат...'.\n"
-        "2. НАЧИНАЙ СРАЗУ с главного тейка или сурового жизненного закона.\n"
-        "3. Мрачный фатализм, уличная философия, метафоры Кровостока (безысходность, физиология, криминал, но с внутренним стержнем).\n"
-        "4. Строго 1-2 коротких предложения. Только концентрат смысла.\n\n"
-        "Пример: 'Гниль съедает слабых, а сильные просто молча жуют стекло. Выплюнь кровь и иди дальше.'"
+        "Ты — старый, повидавший дерьма текстовик группы «Кровосток».\n\n"
+        f"{tone_instruction}\n\n"
+        "СТРОГИЕ ПРАВИЛА:\n"
+        "1. ЗАПРЕЩЕНО пересказывать ситуацию. Не используй слова из запроса. "
+        "Никаких вступлений.\n"
+        "2. Начинай сразу с главного тейка.\n"
+        "3. Строго 1-2 коротких предложения. Только концентрат.\n\n"
+        "Пример негатив: 'Гниль съедает слабых, а сильные молча жуют стекло.'\n"
+        "Пример позитив: 'Чемпион — это не тот, кто не падал, а тот, кто вставал быстрее всех.'"
     )
     try:
         response = _get_client().chat.completions.create(
@@ -78,12 +117,26 @@ def generate_hyde(user_query: str) -> str:
         return response.choices[0].message.content.strip()
     except Exception as e:
         print(f"[ОШИБКА HyDE] {e}")
-        # Фолбэк: ищем по сырому запросу
         return user_query
 
 
+def _merge_candidates(hyde_pool: list, raw_pool: list) -> list:
+    """Объединяет два пула кандидатов, дедуплицирует по тексту цитаты,
+    перенумеровывает. HyDE-кандидаты идут первыми."""
+    seen = set()
+    merged = []
+    for c in hyde_pool + raw_pool:
+        key = c["quote"].strip()
+        if key not in seen:
+            seen.add(key)
+            merged.append(dict(c))
+    for new_id, c in enumerate(merged):
+        c["id"] = new_id
+    return merged
+
+
 def rerank_quotes(user_query: str, candidates: list) -> dict:
-    """Шаг 3 (Rerank): Groq выбирает одну лучшую цитату из кандидатов."""
+    """Шаг 3 (Rerank): Groq выбирает одну лучшую цитату из объединённого пула."""
     if not candidates:
         return {"quote": "База пуста.", "track": "Unknown"}
 
@@ -125,9 +178,8 @@ def rerank_quotes(user_query: str, candidates: list) -> dict:
             messages=[{"role": "user", "content": prompt}],
         )
         answer = response.choices[0].message.content.strip()
-        print(f"[DEBUG RERANK] Ответ Groq: {answer.replace(chr(10), ' | ')}")
+        print(f"[DEBUG RERANK] {answer.replace(chr(10), ' | ')}")
 
-        # Берём ПОСЛЕДНИЙ номер в скобках (после рассуждения), иначе — последнее число
         ids = re.findall(r"\[(\d+)\]", answer) or re.findall(r"\d+", answer)
         if ids:
             best_id = int(ids[-1])
@@ -141,32 +193,35 @@ def rerank_quotes(user_query: str, candidates: list) -> dict:
 
 
 def find_quote(user_message: str) -> dict:
-    """Главный пайплайн: HyDE -> Vector Search -> Rerank.
+    """Главный пайплайн: HyDE + raw → объединённый пул → Rerank.
 
     Drop-in замена core_hf.find_quote: тот же возврат {quote, track}.
     """
     print(f"\n[GROQ] Запрос: {user_message}")
 
+    raw_pool = retrieve_candidates(
+        embed_text=user_message,
+        filter_against=user_message,
+        n=N_PER_ARM,
+    )
+
     if USE_HYDE:
         hyde = generate_hyde(user_message)
         print(f"[GROQ] HyDE-гипотеза: {hyde}")
-        embed_text = hyde
+        hyde_pool = retrieve_candidates(
+            embed_text=hyde,
+            filter_against=user_message,
+            n=N_PER_ARM,
+        )
     else:
-        embed_text = user_message
+        hyde_pool = []
 
-    # Ищем по гипотезе, но мусор фильтруем против реального запроса пользователя
-    candidates = retrieve_candidates(
-        embed_text=embed_text,
-        filter_against=user_message,
-        n=N_CANDIDATES,
-    )
+    merged = _merge_candidates(hyde_pool, raw_pool)
+    valid = [c for c in merged if c["valid"]]
+    pool = valid if valid else merged
 
-    # На реранкинг подаём только валидные кандидаты (если есть)
-    valid = [c for c in candidates if c["valid"]]
-    pool = valid if valid else candidates
-    # Перенумеруем для компактного промпта
-    for new_id, c in enumerate(pool):
-        c["id"] = new_id
+    print(f"[GROQ] Пул: {len(pool)} уникальных кандидатов "
+          f"(hyde={len(hyde_pool)}, raw={len(raw_pool)})")
 
     result = rerank_quotes(user_message, pool)
     print(f"[GROQ] Выбрана: {result['quote'][:80]}")
@@ -176,7 +231,8 @@ def find_quote(user_message: str) -> dict:
 if __name__ == "__main__":
     print("=" * 60)
     print(f"  КровостокLM — Groq Mode ({GROQ_MODEL})")
-    print(f"  HyDE: {'вкл' if USE_HYDE else 'выкл'} | Эмбеддер: {EMBEDDING_MODEL}")
+    print(f"  HyDE: {'вкл (гибрид)' if USE_HYDE else 'выкл (raw only)'}")
+    print(f"  Эмбеддер: {EMBEDDING_MODEL}")
     print("=" * 60)
     while True:
         try:
