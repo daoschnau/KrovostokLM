@@ -1,0 +1,21 @@
+# Секреты и окружения
+.env
+.venv/
+venv/
+env/
+
+# Питон-кэш
+__pycache__/
+*.py[cod]
+
+# В рантайме НЕ нужны (нужна только data/vector_db):
+data/raw/
+data/processed/
+
+# Локальные логи батч-прогонов
+logs/
+
+# Git и доки
+.git/
+.gitignore
+*.md

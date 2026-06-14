@@ -1,33 +1,39 @@
 """
-Пайплайн с LLM-прокладкой на Groq (бесплатный tier, открытая модель).
+Пайплайн с LLM-прокладкой на Groq — одноплечий HyDE + реранкинг.
 
-Архитектура (гибридный поиск):
-  1. HyDE    — Groq генерирует короткую «мораль в духе Кровостока» по ситуации.
-  2. Поиск   — два параллельных запроса к ChromaDB:
-               • по HyDE-гипотезе (семантически далёкие, но меткие цитаты)
-               • по сырому запросу пользователя (конкретные детали ситуации)
-               Пулы объединяются и дедупируются → ~25 уникальных кандидатов.
-  3. Rerank  — Groq выбирает одну цитату, следя за валентностью и избегая
-               универсальных «магнит-цитат».
+Архитектура (выбрана по результатам трёх тестовых прогонов):
+  1. HyDE   — Groq пишет короткую «мораль в духе Кровостока» по ситуации.
+              Тон подстраивается под валентность запроса (позитив/негатив),
+              чтобы достижения не получали мрачных гипотез.
+  2. Поиск  — гипотеза векторизуется локальным e5, ChromaDB отдаёт топ-N.
+  3. Rerank — Groq выбирает одну цитату, следя за знаком эмоции, мягкостью на
+              горе, трезвостью и избегая универсальных «магнит-цитат».
+  +  Анти-магнит — на уровне сессии не повторяем недавно выданные треки
+              (в Telegram сессия = chat_id), чтобы один трек не липнул ко всему.
 
-Зачем гибридный поиск: HyDE уходит семантически дальше и находит жемчужины,
-которых raw не видит (#11, #14, #15, #20, #24 по тестовым прогонам). Raw держит
-конкретные детали ситуации (#12 «начну с аптеки», #16 «качался/потел», #21
-«малышка ходить не сможет»). Реранкер делает финальный выбор из объединённого пула.
+УСТОЙЧИВОСТЬ (для публичного бота — главное требование):
+  Groq free tier ограничен дневным бюджетом токенов (TPD, per-model). Когда
+  бюджет кончается, бот НЕ падает, а плавно деградирует в чистый e5-retrieval
+  (без API, без лимита). Механизмы:
+    • любой сбой Groq → фоллбэк на лучший валидный кандидат e5;
+    • после rate-limit включается cooldown: на время мы вообще не дёргаем
+      Groq, отвечая мгновенно на сыром e5 (без лишней латентности под нагрузкой);
+    • кэш одинаковых запросов экономит бюджет на повторах.
 
-Модель: llama-3.3-70b-versatile (Groq free tier, сильна в русском).
+Модель: llama-3.3-70b-versatile (качество). Для публичного бота имеет смысл
+        GROQ_MODEL=llama-3.1-8b-instant — слабее, но ~5x дневной бюджет.
 Ключ:   GROQ_API_KEY в .env
-
-HyDE можно отключить (USE_HYDE=false в .env) — тогда поиск идёт только по сырому
-запросу пользователя.
 """
 import os
 import re
 import sys
+import time
+import threading
+from collections import deque
 from pathlib import Path
 
 from dotenv import load_dotenv
-from groq import Groq
+from groq import Groq, RateLimitError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -37,9 +43,21 @@ load_dotenv()
 
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 USE_HYDE = os.getenv("USE_HYDE", "true").lower() not in {"false", "0", "no"}
-N_PER_ARM = 15  # кандидатов от каждого плеча поиска
+RATE_LIMIT_COOLDOWN = int(os.getenv("GROQ_COOLDOWN_SEC", "120"))
+
+# Анти-магнит: сколько последних выданных треков помним на сессию, чтобы не
+# повторять один и тот же трек подряд (в Telegram сессия = chat_id). 0 — выключить.
+RECENT_TRACKS_MEMORY = int(os.getenv("GROQ_RECENT_TRACKS", "5"))
+
+# Бюджет токенов — главный пожиратель это промпт реранкера, поэтому пул маленький.
+N_CANDIDATES = 12
 
 _client = None
+_tokens_used = 0
+_groq_disabled_until = 0.0  # пока time.time() < этого — Groq не дёргаем (cooldown)
+_cache = {}                 # нормализованный запрос -> результат
+_recent_by_session = {}     # session_id -> deque недавно выданных треков
+_lock = threading.Lock()
 
 
 def _get_client() -> Groq:
@@ -51,134 +69,157 @@ def _get_client() -> Groq:
                 "GROQ_API_KEY не задан. Получи бесплатный ключ на https://console.groq.com "
                 "и положи в .env (см. .env.example)"
             )
-        _client = Groq(api_key=api_key)
+        # SDK сам ретраит транзиентные 429 (TPM-всплески) с backoff
+        _client = Groq(api_key=api_key, max_retries=3)
     return _client
 
 
-def _classify_valence(user_query: str) -> str:
-    """Быстрая лексическая эвристика: позитив или негатив.
+def tokens_used() -> int:
+    return _tokens_used
 
-    Не вызывает LLM — используется внутри generate_hyde, чтобы направить
-    тон гипотезы и избежать мрачных HyDE для позитивных запросов.
-    """
+
+def _track_usage(response) -> None:
+    global _tokens_used
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        _tokens_used += getattr(usage, "total_tokens", 0) or 0
+
+
+def _groq_available() -> bool:
+    """False, если мы на cooldown после недавнего rate-limit."""
+    return time.time() >= _groq_disabled_until
+
+
+def _trip_cooldown() -> None:
+    """Включает cooldown после rate-limit: временно уводим бота на сырой e5."""
+    global _groq_disabled_until
+    _groq_disabled_until = time.time() + RATE_LIMIT_COOLDOWN
+    print(f"[GROQ] Rate limit — cooldown {RATE_LIMIT_COOLDOWN}s, временно работаем на сыром e5")
+
+
+def _normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _recent_tracks(session_id: str) -> set:
+    """Треки, недавно выданные в этой сессии (для анти-магнит фильтра)."""
+    with _lock:
+        dq = _recent_by_session.get(session_id)
+        return set(dq) if dq else set()
+
+
+def _remember_track(session_id: str, track: str) -> None:
+    """Запоминает выданный трек в скользящем окне сессии."""
+    if RECENT_TRACKS_MEMORY <= 0:
+        return
+    with _lock:
+        dq = _recent_by_session.get(session_id)
+        if dq is None:
+            dq = deque(maxlen=RECENT_TRACKS_MEMORY)
+            _recent_by_session[session_id] = dq
+        dq.append(track)
+
+
+def _classify_valence(user_query: str) -> str:
+    """Лексическая эвристика (без LLM): позитив или негатив."""
     positive_markers = {
         "горжусь", "победил", "добежал", "подтянулся", "купил", "накопил",
         "сделал", "достиг", "бросил пить", "держусь", "начал", "впервые",
         "рад", "счастлив", "удалось", "получилось", "наконец", "цель",
-        "написал", "запустил", "заработал", "выиграл",
+        "написал", "запустил", "заработал", "выиграл", "годовщина",
     }
-    query_lower = user_query.lower()
-    if any(m in query_lower for m in positive_markers):
-        return "позитив"
-    return "негатив"
+    q = user_query.lower()
+    return "позитив" if any(m in q for m in positive_markers) else "негатив"
 
 
-def generate_hyde(user_query: str) -> str:
-    """Шаг 1 (HyDE): суровая или дерзкая мораль в духе Кровостока.
+def generate_hyde(user_query: str) -> str | None:
+    """Шаг 1 (HyDE): мораль в духе Кровостока, тон по валентности.
 
-    Тон регулируется валентностью запроса: позитивные запросы получают
-    дерзкую гипотезу, чтобы не тащить мрачный кластер.
+    Возвращает None при сбое/cooldown — вызывающий код уходит на сырой запрос.
     """
-    valence = _classify_valence(user_query)
+    if not _groq_available():
+        return None
 
+    valence = _classify_valence(user_query)
     if valence == "позитив":
-        tone_instruction = (
-            "Запрос несёт ПОЗИТИВНЫЙ знак (достижение, гордость, стойкость, победа). "
-            "Выдай дерзкое, кайфовое, мрачновато-торжествующее напутствие — кровосток-style. "
+        tone = (
+            "Запрос ПОЗИТИВНЫЙ (достижение, гордость, стойкость, победа). "
+            "Гипотеза тоже про подъём — дерзость, кураж, мрачноватое торжество. "
             "НЕ используй образы смерти, боли, безысходности, гниения."
         )
     else:
-        tone_instruction = (
-            "Выдай суровую философскую мораль — мрачный фатализм, уличная философия, "
-            "метафоры Кровостока (безысходность, физиология, криминал, но с внутренним стержнем)."
+        tone = (
+            "Выдай суровую мораль — мрачный фатализм, уличная философия, "
+            "метафоры Кровостока (безысходность, физиология, криминал, но со стержнем)."
         )
 
     system_prompt = (
         "Ты — старый, повидавший дерьма текстовик группы «Кровосток».\n\n"
-        f"{tone_instruction}\n\n"
-        "СТРОГИЕ ПРАВИЛА:\n"
-        "1. ЗАПРЕЩЕНО пересказывать ситуацию. Не используй слова из запроса. "
-        "Никаких вступлений.\n"
-        "2. Начинай сразу с главного тейка.\n"
-        "3. Строго 1-2 коротких предложения. Только концентрат.\n\n"
+        f"{tone}\n\n"
+        "ПРАВИЛА:\n"
+        "1. ЗАПРЕЩЕНО пересказывать ситуацию и использовать слова из запроса.\n"
+        "2. Начинай сразу с тейка. Строго 1-2 коротких предложения.\n\n"
         "Пример негатив: 'Гниль съедает слабых, а сильные молча жуют стекло.'\n"
-        "Пример позитив: 'Чемпион — это не тот, кто не падал, а тот, кто вставал быстрее всех.'"
+        "Пример позитив: 'Чемпион — не тот, кто не падал, а тот, кто вставал быстрее всех.'"
     )
     try:
         response = _get_client().chat.completions.create(
             model=GROQ_MODEL,
-            max_tokens=100,
+            max_tokens=80,
             temperature=0.8,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_query},
             ],
         )
+        _track_usage(response)
         return response.choices[0].message.content.strip()
+    except RateLimitError:
+        _trip_cooldown()
+        return None
     except Exception as e:
         print(f"[ОШИБКА HyDE] {e}")
-        return user_query
+        return None
 
 
-def _merge_candidates(hyde_pool: list, raw_pool: list) -> list:
-    """Объединяет два пула кандидатов, дедуплицирует по тексту цитаты,
-    перенумеровывает. HyDE-кандидаты идут первыми."""
-    seen = set()
-    merged = []
-    for c in hyde_pool + raw_pool:
-        key = c["quote"].strip()
-        if key not in seen:
-            seen.add(key)
-            merged.append(dict(c))
-    for new_id, c in enumerate(merged):
-        c["id"] = new_id
-    return merged
+def rerank_quotes(user_query: str, candidates: list) -> dict | None:
+    """Шаг 3 (Rerank): Groq выбирает одну цитату.
 
-
-def rerank_quotes(user_query: str, candidates: list) -> dict:
-    """Шаг 3 (Rerank): Groq выбирает одну лучшую цитату из объединённого пула."""
-    if not candidates:
-        return {"quote": "База пуста.", "track": "Unknown"}
+    Возвращает None при сбое/cooldown — вызывающий код берёт лучший e5-кандидат.
+    """
+    if not candidates or not _groq_available():
+        return None
 
     quotes_text = "\n\n".join(
         f"[{c['id']}] {c['quote']} (Трек: {c['track']})" for c in candidates
     )
-
     prompt = (
         f"Ситуация пользователя: {user_query}\n\n"
-        f"Кандидаты (цитаты группы Кровосток):\n{quotes_text}\n\n"
-        "Выбери ровно ОДНУ цитату — идеальный ироничный или суровый комментарий "
-        "именно к ЭТОЙ ситуации.\n\n"
-        "КРИТИЧЕСКИЕ ПРАВИЛА:\n"
-        "1. ЗНАК ЭМОЦИИ (главное правило). Сначала определи знак ситуации:\n"
-        "   - ПОЗИТИВ (достижение, гордость, радость, стойкость, выздоровление, победа) — "
-        "выбирай цитату с совпадающим знаком: дерзость, кураж, мрачноватое торжество. "
-        "КАТЕГОРИЧЕСКИ не выбирай строки про смерть, боль, наркоту, безысходность, суицид — "
-        "это ломает тон.\n"
-        "   - НЕГАТИВ (боль, потеря, тревога, пустота) — подойдёт фатализм, чёрный юмор, "
-        "стоицизм.\n"
-        "2. НЕТ УНИВЕРСАЛИЯМ. Избегай общефилософских строк, которые одинаково подходят к "
-        "любой ситуации (абстрактно про «боль», «кровь», «раны», «одиночество вообще»). "
-        "Выбирай цитату, цепляющую КОНКРЕТНУЮ деталь, образ или поворот этой ситуации.\n"
-        "3. ФИЛЬТР МУСОРА. База нарезана механически. Игнорируй цитаты, которые обрываются "
-        "на предлогах или лишены законченной мысли. Только цельный, хлёсткий панчлайн.\n"
-        "4. НЕ В ЛОБ. Избегай буквального повтора слов из ситуации. Нужна смысловая "
-        "метафора, а не совпадение корней.\n\n"
-        "ФОРМАТ ОТВЕТА (строго):\n"
-        "ЗНАК: <позитив/негатив>\n"
-        "ПРИЧИНА: <одна короткая фраза, почему эта цитата>\n"
-        "ОТВЕТ: [номер]"
+        f"Кандидаты (цитаты Кровостока):\n{quotes_text}\n\n"
+        "Выбери ОДНУ цитату — меткий ироничный или суровый комментарий к ЭТОЙ ситуации.\n\n"
+        "ПРАВИЛА:\n"
+        "1. ЗНАК ЭМОЦИИ. Если ситуация позитивная (достижение, гордость, стойкость) — "
+        "НЕ бери цитаты про смерть, боль, наркоту, безысходность. Тон цитаты должен "
+        "совпадать со знаком ситуации.\n"
+        "2. ТРЕЗВОСТЬ. Для ситуаций про отказ от вредного (бросил пить/курить, трезвость, "
+        "воздержание) НЕ выбирай цитаты, прославляющие употребление алкоголя или наркотиков.\n"
+        "3. ГОРЕ. Для запросов про смерть, утрату, похороны близких выбирай цитату скорее "
+        "тихую и печальную, чем шок-комичную или абсурдную.\n"
+        "4. НЕТ УНИВЕРСАЛИЯМ — избегай абстрактных строк, подходящих к чему угодно. "
+        "Цепляй конкретную деталь ситуации.\n"
+        "5. Игнорируй обрывки без законченной мысли.\n\n"
+        "Ответь строго: ЗНАК: <позитив/негатив>  ОТВЕТ: [номер]"
     )
-
     try:
         response = _get_client().chat.completions.create(
             model=GROQ_MODEL,
-            max_tokens=160,
+            max_tokens=40,
             temperature=0.0,
             messages=[{"role": "user", "content": prompt}],
         )
+        _track_usage(response)
         answer = response.choices[0].message.content.strip()
-        print(f"[DEBUG RERANK] {answer.replace(chr(10), ' | ')}")
+        print(f"[DEBUG RERANK] {answer.replace(chr(10), ' ')}")
 
         ids = re.findall(r"\[(\d+)\]", answer) or re.findall(r"\d+", answer)
         if ids:
@@ -186,53 +227,76 @@ def rerank_quotes(user_query: str, candidates: list) -> dict:
             for c in candidates:
                 if c["id"] == best_id:
                     return {"quote": c["quote"], "track": c["track"]}
-        return {"quote": candidates[0]["quote"], "track": candidates[0]["track"]}
+        return None
+    except RateLimitError:
+        _trip_cooldown()
+        return None
     except Exception as e:
         print(f"[ОШИБКА Rerank] {e}")
-        return {"quote": candidates[0]["quote"], "track": candidates[0]["track"]}
+        return None
 
 
-def find_quote(user_message: str) -> dict:
-    """Главный пайплайн: HyDE + raw → объединённый пул → Rerank.
+def find_quote(user_message: str, session_id: str = "_global") -> dict:
+    """Главный пайплайн. Никогда не бросает исключений: при любом сбое Groq
+    деградирует в чистый e5-retrieval.
 
-    Drop-in замена core_hf.find_quote: тот же возврат {quote, track}.
+    session_id — изолирует анти-магнит память (в Telegram передаём chat_id,
+    чтобы цитаты одного юзера не влияли на других). По умолчанию общая сессия.
+
+    Drop-in замена core_hf.find_quote: возврат {quote, track}.
     """
+    key = _normalize(user_message)
+    with _lock:
+        if key in _cache:
+            print(f"[GROQ] Кэш-хит: {user_message[:50]}")
+            return _cache[key]
+
     print(f"\n[GROQ] Запрос: {user_message}")
 
-    raw_pool = retrieve_candidates(
-        embed_text=user_message,
+    # HyDE-гипотеза (если доступна), иначе ищем по сырому запросу
+    hyde = generate_hyde(user_message) if USE_HYDE else None
+    if hyde:
+        print(f"[GROQ] HyDE: {hyde}")
+    embed_text = hyde or user_message
+
+    candidates = retrieve_candidates(
+        embed_text=embed_text,
         filter_against=user_message,
-        n=N_PER_ARM,
+        n=N_CANDIDATES,
     )
+    valid = [c for c in candidates if c["valid"]] or candidates
 
-    if USE_HYDE:
-        hyde = generate_hyde(user_message)
-        print(f"[GROQ] HyDE-гипотеза: {hyde}")
-        hyde_pool = retrieve_candidates(
-            embed_text=hyde,
-            filter_against=user_message,
-            n=N_PER_ARM,
-        )
+    # Анти-магнит: выкидываем недавно показанные треки, если остаётся из чего
+    # выбирать (>= 3 кандидата), иначе оставляем как есть — лучше повтор, чем пусто.
+    recent = _recent_tracks(session_id)
+    if recent:
+        fresh = [c for c in valid if c["track"] not in recent]
+        if len(fresh) >= 3:
+            valid = fresh
+            print(f"[GROQ] Анти-магнит: исключены треки {recent}")
+
+    for new_id, c in enumerate(valid):
+        c["id"] = new_id
+
+    result = rerank_quotes(user_message, valid)
+    if result is None:
+        # Деградация: лучший валидный кандидат e5 (поведение «сырого e5»)
+        best = valid[0]
+        result = {"quote": best["quote"], "track": best["track"]}
+        print(f"[GROQ] Деградация на e5: {result['quote'][:60]}")
     else:
-        hyde_pool = []
+        print(f"[GROQ] Выбрана: {result['quote'][:60]}")
 
-    merged = _merge_candidates(hyde_pool, raw_pool)
-    valid = [c for c in merged if c["valid"]]
-    pool = valid if valid else merged
-
-    print(f"[GROQ] Пул: {len(pool)} уникальных кандидатов "
-          f"(hyde={len(hyde_pool)}, raw={len(raw_pool)})")
-
-    result = rerank_quotes(user_message, pool)
-    print(f"[GROQ] Выбрана: {result['quote'][:80]}")
+    _remember_track(session_id, result["track"])
+    with _lock:
+        _cache[key] = result
     return result
 
 
 if __name__ == "__main__":
     print("=" * 60)
     print(f"  КровостокLM — Groq Mode ({GROQ_MODEL})")
-    print(f"  HyDE: {'вкл (гибрид)' if USE_HYDE else 'выкл (raw only)'}")
-    print(f"  Эмбеддер: {EMBEDDING_MODEL}")
+    print(f"  HyDE: {'вкл' if USE_HYDE else 'выкл'} | Эмбеддер: {EMBEDDING_MODEL}")
     print("=" * 60)
     while True:
         try:
@@ -246,3 +310,4 @@ if __name__ == "__main__":
             continue
         res = find_quote(user_input)
         print(f'\n"{res["quote"]}"\n— {res["track"]}\n')
+        print(f"[токенов израсходовано за сессию: {tokens_used()}]")

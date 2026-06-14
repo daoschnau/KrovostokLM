@@ -1,0 +1,9 @@
+# Запуск на сервере:  docker compose up -d --build
+# Логи:               docker compose logs -f
+# Остановка:          docker compose down
+services:
+  bot:
+    build: .
+    container_name: krovostoklm-bot
+    env_file: .env          # TG_BOT_TOKEN, GROQ_API_KEY, DEEPINFRA_API_KEY
+    restart: unless-stopped # сам поднимется после падения/перезагрузки сервера
