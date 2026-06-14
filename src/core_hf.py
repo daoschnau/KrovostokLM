@@ -80,34 +80,63 @@ def _is_valid(text: str, user_query: str) -> bool:
     return True
 
 
+def embed_query(text: str) -> list:
+    """Векторизует текст как поисковый запрос (e5 требует prefix 'query:')."""
+    model = _get_model()
+    return model.encode("query: " + text, normalize_embeddings=True).tolist()
+
+
+def retrieve_candidates(
+    embed_text: str,
+    filter_against: str | None = None,
+    n: int = N_CANDIDATES,
+) -> list:
+    """Достаёт топ-N кандидатов из ChromaDB по тексту embed_text.
+
+    embed_text     — текст, который векторизуется для поиска (запрос или HyDE-гипотеза).
+    filter_against — текст пользователя, против которого проверяется эвристика
+                     валидности (если None — берётся embed_text).
+    Возвращает список dict: {id, quote, track, distance, valid}.
+    """
+    if filter_against is None:
+        filter_against = embed_text
+
+    collection = _get_collection()
+    query_embedding = embed_query(embed_text)
+    results = collection.query(query_embeddings=[query_embedding], n_results=n)
+
+    docs = results["documents"][0]
+    metas = results["metadatas"][0]
+    distances = results["distances"][0]
+
+    candidates = []
+    for i, (doc, meta, dist) in enumerate(zip(docs, metas, distances)):
+        candidates.append({
+            "id": i,
+            "quote": doc,
+            "track": meta["track_name"],
+            "distance": dist,
+            "valid": _is_valid(doc, filter_against),
+        })
+    return candidates
+
+
 def find_quote(user_message: str) -> dict:
     """Находит цитату по запросу пользователя без использования LLM.
 
     Возвращает dict с ключами 'quote' и 'track'.
     """
-    model = _get_model()
-    collection = _get_collection()
-
-    # e5 требует prefix 'query:' для поискового запроса
-    query_embedding = model.encode(
-        "query: " + user_message,
-        normalize_embeddings=True,
-    ).tolist()
-
-    results = collection.query(query_embeddings=[query_embedding], n_results=N_CANDIDATES)
-    docs = results["documents"][0]
-    metas = results["metadatas"][0]
-    distances = results["distances"][0]
+    candidates = retrieve_candidates(user_message)
 
     print(f"\n[HF-DIRECT] Запрос: {user_message}")
     print("[HF-DIRECT] Топ-3 из ChromaDB (расстояния):")
-    for i in range(min(3, len(docs))):
-        print(f"  [{i}] dist={distances[i]:.4f} | {docs[i][:60]}...")
+    for c in candidates[:3]:
+        print(f"  [{c['id']}] dist={c['distance']:.4f} | {c['quote'][:60]}...")
 
-    for doc, meta in zip(docs, metas):
-        if _is_valid(doc, user_message):
-            print(f"[HF-DIRECT] Выбрана: {doc[:80]}")
-            return {"quote": doc, "track": meta["track_name"]}
+    for c in candidates:
+        if c["valid"]:
+            print(f"[HF-DIRECT] Выбрана: {c['quote'][:80]}")
+            return {"quote": c["quote"], "track": c["track"]}
 
     # Запасной вариант: топ-1 без фильтрации
-    return {"quote": docs[0], "track": metas[0]["track_name"]}
+    return {"quote": candidates[0]["quote"], "track": candidates[0]["track"]}

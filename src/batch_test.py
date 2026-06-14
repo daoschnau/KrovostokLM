@@ -6,21 +6,25 @@
 
 Запуск из корня проекта:
     python src/batch_test.py путь/к/queries.txt
-    python src/batch_test.py путь/к/queries.txt --out logs/my_run.txt
+    python src/batch_test.py --backend groq          # с LLM-реранкером
+    python src/batch_test.py --backend hf --out logs/my_run.txt
+
+Бэкенды:
+    hf   — чистый retrieval на e5 (без LLM), core_hf.find_quote
+    groq — e5 + HyDE + реранкинг на Groq, core_groq.find_quote
 
 Если путь к файлу запросов не указан, берётся data/test_queries.txt.
-Лог по умолчанию: logs/batch_<timestamp>.txt
+Лог по умолчанию: logs/batch_<backend>_<timestamp>.txt
 """
 import re
 import sys
 import argparse
+import importlib
 from pathlib import Path
 from datetime import datetime
 
 # Позволяет запускать скрипт напрямую без установки пакета
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from core_hf import find_quote, EMBEDDING_MODEL
 
 base_dir = Path(__file__).resolve().parent.parent
 
@@ -59,7 +63,19 @@ def main():
         help="Путь к файлу с пронумерованными запросами",
     )
     parser.add_argument("--out", default=None, help="Путь к файлу лога")
+    parser.add_argument(
+        "--backend",
+        choices=["hf", "groq"],
+        default="hf",
+        help="hf — чистый retrieval; groq — e5 + HyDE + реранкинг на Groq",
+    )
     args = parser.parse_args()
+
+    # Импортируем выбранный бэкенд лениво (groq тянет API-ключ только при выборе)
+    module_name = "core_groq" if args.backend == "groq" else "core_hf"
+    backend = importlib.import_module(module_name)
+    find_quote = backend.find_quote
+    embedding_model = backend.EMBEDDING_MODEL
 
     queries_path = Path(args.queries)
     if not queries_path.exists():
@@ -75,18 +91,20 @@ def main():
     if args.out:
         out_path = Path(args.out)
     else:
-        out_path = base_dir / "logs" / f"batch_{timestamp}.txt"
+        out_path = base_dir / "logs" / f"batch_{args.backend}_{timestamp}.txt"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"Запросов к прогону: {len(items)}")
-    print(f"Модель: {EMBEDDING_MODEL}")
+    print(f"Бэкенд: {args.backend}")
+    print(f"Эмбеддер: {embedding_model}")
     print(f"Лог: {out_path}\n")
 
     lines = []
     lines.append("=" * 70)
     lines.append("KrovostokLM — батч-прогон тестовых запросов")
     lines.append(f"Дата:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append(f"Модель:  {EMBEDDING_MODEL}")
+    lines.append(f"Бэкенд:  {args.backend}")
+    lines.append(f"Эмбеддер:{embedding_model}")
     lines.append(f"Запросы: {queries_path}")
     lines.append(f"Всего:   {len(items)}")
     lines.append("=" * 70)
