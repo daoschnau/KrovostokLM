@@ -1,89 +1,106 @@
-import os
+import re
 import argparse
 import pandas as pd
 from pathlib import Path
 
-def clean_line(line: str) -> str:
-    """Базовая очистка строки от лишних пробелов и спецсимволов."""
-    return " ".join(line.split())
+# Кровосток пишет рифмованными двустишиями, поэтому базовая смысловая
+# единица — куплет из двух строк. Берём НЕперекрывающиеся пары, чтобы не
+# плодить обрывки на половине фразы (как делал старый sliding window).
+LINES_PER_CHUNK = 2
 
-def chunk_text(text: str, window_size: int = 2) -> list[str]:
-    """Максимально честный Sliding Window."""
-    # Убираем фильтр длины, чтобы не терять короткие, но важные строки
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-    
-    chunks = []
-    # Если строк меньше окна, берем всё что есть
-    if len(lines) <= window_size:
-        return [" \n ".join(lines)] if lines else []
-    
-    # Теперь точно пройдем по каждой возможной паре
-    for i in range(len(lines) - window_size + 1):
-        chunk = " \n ".join(lines[i:i + window_size])
-        chunks.append(chunk)
-        
-    return chunks
+# Минимальная длина нормализованного текста, чтобы отсечь пустышки/мусор.
+MIN_CHUNK_LEN = 8
 
-def process_corpus(input_dir: Path) -> pd.DataFrame:
-    """
-    Обходит директорию с сырыми текстами, чанкует их и собирает в единый DataFrame.
-    """
-    data = []
-    
-    for filepath in input_dir.glob('*.txt'):
-        song_title = filepath.stem # Имя файла используем как название трека
-        with open(filepath, 'r', encoding='utf-8') as file:
-            raw_text = file.read()
-            
-        chunks = chunk_text(raw_text)
-        
-        for idx, chunk in enumerate(chunks):
-            data.append({
-                "track_name": song_title,
-                "chunk_id": f"{song_title}_part_{idx+1}",
-                "text": chunk
-            })
-            
-    return pd.DataFrame(data)
-
-import os
-import argparse
-import pandas as pd
-from pathlib import Path
 
 def clean_line(line: str) -> str:
-    """Базовая очистка строки от лишних пробелов и спецсимволов."""
+    """Схлопывает лишние пробелы."""
     return " ".join(line.split())
 
-def chunk_text(text: str, lines_per_chunk: int = 2) -> list[str]:
-    """Разбивает текст на смысловые блоки (двустишия)."""
-    lines = [clean_line(line) for line in text.split('\n') if line.strip()]
-    chunks = []
-    for i in range(0, len(lines), lines_per_chunk):
-        chunk_lines = lines[i:i + lines_per_chunk]
-        chunk_text = " \n ".join(chunk_lines)
-        chunks.append(chunk_text)
-    return chunks
+
+def is_section_marker(line: str) -> bool:
+    """Строки вида [Припев], (x2) и т.п. — это разметка, а не текст."""
+    return bool(re.match(r"^\s*[\[\(].*[\]\)]\s*$", line))
+
+
+def normalize(text: str) -> str:
+    """Ключ для дедупликации: регистр, пунктуация и пробелы не важны."""
+    return re.sub(r"[^\w]+", " ", text.lower()).strip()
+
+
+def is_quality_chunk(chunk: str) -> bool:
+    """Отсекает синтаксически незавершённые фрагменты до попадания в базу."""
+    text = chunk.strip()
+
+    # Слишком мало слов
+    if len(text.split()) < 6:
+        return False
+
+    # Заканчивается запятой или двоеточием — фраза явно продолжается дальше
+    if text.rstrip()[-1] in {",", ":"}:
+        return False
+
+    # Артефакт скрапера: «слово ... слово» — обрыв в оригинале
+    if re.search(r"\s\.\.\.\s", text):
+        return False
+
+    return True
+
+
+def chunk_lines(lines: list[str], size: int = LINES_PER_CHUNK) -> list[str]:
+    """Режет строки на НЕперекрывающиеся группы по `size` строк.
+
+    Если в конце остаётся одинокая строка-«сирота» — приклеиваем её к
+    предыдущему чанку, чтобы не было висящего огрызка.
+    """
+    groups: list[list[str]] = []
+    i = 0
+    while i < len(lines):
+        group = lines[i:i + size]
+        if len(group) < size and groups:
+            groups[-1].extend(group)
+            break
+        groups.append(group)
+        i += size
+    return [" \n ".join(g) for g in groups]
+
 
 def process_corpus(input_dir: Path) -> pd.DataFrame:
-    """Обходит директорию, чанкует тексты и собирает DataFrame."""
-    data = []
-    for filepath in input_dir.glob('*.txt'):
-        song_title = filepath.stem
-        with open(filepath, 'r', encoding='utf-8') as file:
-            raw_text = file.read()
-            
-        chunks = chunk_text(raw_text)
-        for idx, chunk in enumerate(chunks):
-            data.append({
-                "track_name": song_title,
-                "chunk_id": f"{song_title}_part_{idx+1}",
-                "text": chunk
+    """Обходит сырые тексты, режет на куплеты и собирает DataFrame.
+
+    Попутно глобально дедуплицирует одинаковые куплеты: это убирает
+    многократно повторяющиеся припевы и дубликаты одной песни, лежащие
+    под разными именами файлов.
+    """
+    rows = []
+    seen: set[str] = set()
+
+    for filepath in sorted(input_dir.glob("*.txt")):
+        track_name = filepath.stem
+        raw_text = filepath.read_text(encoding="utf-8")
+
+        lines = [
+            clean_line(line)
+            for line in raw_text.split("\n")
+            if line.strip() and not is_section_marker(line)
+        ]
+
+        for idx, chunk in enumerate(chunk_lines(lines)):
+            key = normalize(chunk)
+            if len(key) < MIN_CHUNK_LEN or key in seen:
+                continue
+            if not is_quality_chunk(chunk):
+                continue
+            seen.add(key)
+            rows.append({
+                "track_name": track_name,
+                "chunk_id": f"{track_name}_part_{idx + 1}",
+                "text": chunk,
             })
-    return pd.DataFrame(data)
+
+    return pd.DataFrame(rows)
+
 
 def main():
-    # Надежно определяем пути относительно самого скрипта
     base_dir = Path(__file__).resolve().parent.parent
     default_input = base_dir / "data" / "raw"
     default_output = base_dir / "data" / "processed" / "dataset.parquet"
@@ -102,17 +119,17 @@ def main():
 
     print("Начинаю обработку корпуса текстов...")
     df = process_corpus(input_path)
-    
+
     if df.empty:
         print("[ОШИБКА] Тексты не найдены или они пустые.")
         return
 
-    # Сохраняем в Parquet
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(output_path, index=False)
-    
-    print(f"Успешно! Обработано строк: {len(df)}")
-    print(f"Датасет сохранен в: {output_path}")
+
+    print(f"Успешно! Уникальных куплетов: {len(df)} (из {df['track_name'].nunique()} треков)")
+    print(f"Датасет сохранён в: {output_path}")
+
 
 if __name__ == "__main__":
     main()

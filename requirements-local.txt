@@ -1,0 +1,9 @@
+# Зависимости для локального тестирования HF-direct пайплайна
+# Установка: pip install -r requirements-local.txt
+chromadb==1.5.9
+sentence-transformers>=2.7,<3.0
+python-dotenv==1.2.1
+
+# Нужны для пересборки базы (data_prep.py + vectorize.py)
+pandas
+pyarrow
