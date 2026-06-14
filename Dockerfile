@@ -1,22 +1,18 @@
-# Используем легковесный образ Python
+# Лёгкий образ: на сервере нет локальных моделей (всё по API), поэтому
+# не нужны ни torch, ни build-essential — все зависимости ставятся из wheel'ов.
 FROM python:3.11-slim
 
-# Устанавливаем рабочую директорию внутри контейнера
 WORKDIR /app
 
-# Устанавливаем зависимости системы (необходимы для некоторых библиотек, например, numpy/faiss)
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
-# Копируем файл зависимостей
+# Сначала зависимости — слой кешируется между сборками
 COPY requirements.txt .
+RUN pip install -r requirements.txt
 
-# Устанавливаем зависимости Python
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Копируем весь исходный код проекта в контейнер
+# Исходники + вектор-база (data/vector_db). Тяжёлые data/raw, data/processed
+# и логи отсекаются через .dockerignore.
 COPY . .
 
-# Команда для запуска бота
 CMD ["python", "src/bot.py"]

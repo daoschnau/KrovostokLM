@@ -1,5 +1,5 @@
 """
-Версия пайплайна без Claude.
+Версия пайплайна без Claude (retrieval-ядро).
 
 Вместо HyDE + LLM-реранкинга:
   1. Запрос пользователя векторизуется с префиксом 'query:' (требование e5)
@@ -7,17 +7,32 @@
   3. Эвристический фильтр убирает обрывки, запятые-хвосты и буквальные совпадения
   4. Возвращается лучший оставшийся результат
 
-Эмбеддер: intfloat/multilingual-e5-large (~560 MB, лучше для русского, чем MiniLM).
-Документы в базе проиндексированы с префиксом 'passage:' (см. vectorize.py).
+Эмбеддер: intfloat/multilingual-e5-large. Документы в базе проиндексированы с
+префиксом 'passage:' (см. vectorize.py).
+
+ДВА БЭКЕНДА ЭМБЕДДИНГА (EMBED_BACKEND в .env):
+  • "api" (дефолт)  — DeepInfra по HTTP. На сервере НИЧЕГО локально не ставим
+                      (без torch/sentence-transformers), образ ~400 МБ. Векторы
+                      те же, что в базе, — перевекторизация не нужна.
+  • "local"         — sentence-transformers грузит модель локально (~2.5 ГБ).
+                      Только для пересборки базы и офлайн-тестов на дев-машине.
 """
+import os
 import re
+import math
 from pathlib import Path
-from sentence_transformers import SentenceTransformer
+
 import chromadb
+from dotenv import load_dotenv
+
+load_dotenv()
 
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
 COLLECTION_NAME = "krovostok_quotes"
 N_CANDIDATES = 30
+
+EMBED_BACKEND = os.getenv("EMBED_BACKEND", "api").lower()
+DEEPINFRA_URL = "https://api.deepinfra.com/v1/openai/embeddings"
 
 _PREPOSITIONS = {
     "в", "на", "с", "по", "за", "к", "у", "из", "до", "от", "над",
@@ -32,10 +47,12 @@ _model = None
 _collection = None
 
 
-def _get_model() -> SentenceTransformer:
+def _get_model():
     global _model
     if _model is None:
-        print(f"[HF-DIRECT] Загрузка модели {EMBEDDING_MODEL}...")
+        # Тяжёлый импорт — только при EMBED_BACKEND=local, на сервере не выполняется
+        from sentence_transformers import SentenceTransformer
+        print(f"[HF-DIRECT] Загрузка локальной модели {EMBEDDING_MODEL}...")
         _model = SentenceTransformer(EMBEDDING_MODEL)
     return _model
 
@@ -80,10 +97,46 @@ def _is_valid(text: str, user_query: str) -> bool:
     return True
 
 
-def embed_query(text: str) -> list:
-    """Векторизует текст как поисковый запрос (e5 требует prefix 'query:')."""
+def _l2_normalize(vec: list) -> list:
+    """Приводит вектор к единичной длине (база построена на нормированных e5)."""
+    norm = math.sqrt(sum(x * x for x in vec))
+    return vec if norm == 0 else [x / norm for x in vec]
+
+
+def _embed_local(text: str) -> list:
     model = _get_model()
     return model.encode("query: " + text, normalize_embeddings=True).tolist()
+
+
+def _embed_api(text: str) -> list:
+    """Эмбеддинг запроса через DeepInfra — тот же e5-large, что и в базе."""
+    import requests
+
+    api_key = os.getenv("DEEPINFRA_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "DEEPINFRA_API_KEY не задан. Получи ключ на "
+            "https://deepinfra.com/dash/api_keys и положи в .env (см. .env.example). "
+            "Либо переключись на локальную модель: EMBED_BACKEND=local"
+        )
+    resp = requests.post(
+        DEEPINFRA_URL,
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={"model": EMBEDDING_MODEL, "input": ["query: " + text]},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    vec = resp.json()["data"][0]["embedding"]
+    # DeepInfra и локальная модель — один e5, но нормируем сами, чтобы L2-расстояние
+    # в ChromaDB совпадало с тем, как строилась база (normalize_embeddings=True).
+    return _l2_normalize(vec)
+
+
+def embed_query(text: str) -> list:
+    """Векторизует текст как поисковый запрос e5 (prefix 'query:')."""
+    if EMBED_BACKEND == "local":
+        return _embed_local(text)
+    return _embed_api(text)
 
 
 def retrieve_candidates(
