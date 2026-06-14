@@ -7,6 +7,9 @@ python-dotenv==1.2.1
 # LLM-реранкер на Groq (бэкенд groq в core_groq.py / batch_test.py)
 groq>=0.11
 
+# Anthropic SDK — для разовой оценки цитат (score_quotes.py)
+anthropic>=0.40
+
 # Нужны для пересборки базы (data_prep.py + vectorize.py)
 pandas
 pyarrow

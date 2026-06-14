@@ -1,7 +1,7 @@
 """
 Оценка качества цитат в базе по шкале 1-10.
 
-Для каждой цитаты Groq выставляет оценку:
+Для каждой цитаты Claude выставляет оценку:
   — насколько она осмысленна и завершена как мысль
   — насколько звучит как афоризм, которым можно ответить на ситуацию
 
@@ -17,9 +17,13 @@
     ...
   }
 
+Использует Anthropic Batches API (50% скидка, асинхронно).
+Прогресс пишется в data/batch_state.json — при прерывании запуск с --resume
+подхватит ожидающий батч или продолжит парсинг.
+
 Запуск:
   python src/score_quotes.py
-  python src/score_quotes.py --batch-size 8 --model llama-3.1-8b-instant
+  python src/score_quotes.py --batch-size 8 --model claude-haiku-4-5
   python src/score_quotes.py --resume   # продолжить после прерывания
 """
 import os
@@ -31,15 +35,16 @@ from pathlib import Path
 
 import pandas as pd
 from dotenv import load_dotenv
-from groq import Groq, RateLimitError
+import anthropic
 
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATASET_PATH = BASE_DIR / "data" / "processed" / "dataset.parquet"
 SCORES_PATH = BASE_DIR / "data" / "scores.json"
+STATE_PATH = BASE_DIR / "data" / "batch_state.json"
 
-DEFAULT_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+DEFAULT_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5")
 DEFAULT_BATCH = 8
 
 
@@ -69,7 +74,7 @@ SCORE_PROMPT = """\
 """
 
 
-def build_batch_prompt(batch: list[dict]) -> str:
+def build_prompt(batch: list[dict]) -> str:
     lines = []
     for item in batch:
         text = item["text"].replace("\n", " / ")
@@ -83,108 +88,90 @@ def build_batch_prompt(batch: list[dict]) -> str:
 
 def parse_response(raw: str) -> list[dict]:
     raw = raw.strip()
-    # снимаем markdown-обёртку если модель всё равно добавила
     raw = re.sub(r"^```[a-z]*\n?", "", raw)
     raw = re.sub(r"\n?```$", "", raw)
     return json.loads(raw)
 
 
-def score_batch(client: Groq, batch: list[dict], model: str, retries: int = 3) -> list[dict]:
-    prompt = build_batch_prompt(batch)
-    for attempt in range(retries):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                max_tokens=512,
-                temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
+def submit_batch(client: anthropic.Anthropic, mini_batches: list[list[dict]], model: str) -> str:
+    """Отправляет все мини-батчи одним Batch-запросом. Возвращает batch_id."""
+    requests = []
+    for i, mini in enumerate(mini_batches):
+        requests.append(
+            anthropic.types.message_create_params.MessageCreateParamsNonStreaming(
+                custom_id=f"mini_{i}",
+                params={
+                    "model": model,
+                    "max_tokens": 1024,
+                    "temperature": 0.0,
+                    "messages": [{"role": "user", "content": build_prompt(mini)}],
+                },
             )
-            return parse_response(resp.choices[0].message.content)
-        except RateLimitError:
-            wait = 60 * (attempt + 1)
-            print(f"  [rate limit] ждём {wait}с...")
-            time.sleep(wait)
-        except json.JSONDecodeError as e:
-            print(f"  [JSON ошибка] попытка {attempt+1}: {e}")
-            if attempt == retries - 1:
-                raise
-            time.sleep(5)
-        except Exception as e:
-            print(f"  [ошибка] попытка {attempt+1}: {e}")
-            if attempt == retries - 1:
-                raise
-            time.sleep(10)
-    return []
+        )
+    batch = client.messages.batches.create(requests=requests)
+    return batch.id
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH)
-    parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
-    parser.add_argument("--resume", action="store_true", help="Продолжить с прерванного места")
-    args = parser.parse_args()
-
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY не задан в .env")
-
-    client = Groq(api_key=api_key, max_retries=0)
-
-    print(f"Читаем датасет: {DATASET_PATH}")
-    df = pd.read_parquet(DATASET_PATH)
-    print(f"Цитат: {len(df)}, треков: {df['track_name'].nunique()}")
-
-    # Загружаем уже посчитанные оценки если resume
-    scores: dict = {}
-    if args.resume and SCORES_PATH.exists():
-        scores = json.loads(SCORES_PATH.read_text(encoding="utf-8"))
-        print(f"Резьюм: уже оценено {len(scores)} цитат")
-
-    # Строим lookup «следующая цитата» для merge-анализа
-    next_quote: dict[str, dict] = {}
-    by_track = df.groupby("track_name", sort=False)
-    for track, group in by_track:
-        ids = group["chunk_id"].tolist()
-        texts = group["text"].tolist()
-        for i in range(len(ids) - 1):
-            next_quote[ids[i]] = {"chunk_id": ids[i + 1], "text": texts[i + 1]}
-
-    # Готовим батчи (пропускаем уже оценённые)
-    rows = df.to_dict("records")
-    pending = []
-    for row in rows:
-        if row["chunk_id"] in scores:
-            continue
-        nxt = next_quote.get(row["chunk_id"])
-        item = {
-            "chunk_id": row["chunk_id"],
-            "text": row["text"],
-            "has_next": nxt is not None,
-            "next_text": nxt["text"] if nxt else "",
-        }
-        pending.append(item)
-
-    total = len(pending)
-    print(f"К оценке: {total} цитат, батч={args.batch_size}, модель={args.model}")
-    if total == 0:
-        print("Всё уже оценено.")
-        return
-
-    done = 0
-    for i in range(0, total, args.batch_size):
-        batch = pending[i:i + args.batch_size]
-        print(f"  [{done}/{total}] батч {i//args.batch_size + 1}...", end=" ", flush=True)
-
-        try:
-            results = score_batch(client, batch, args.model)
-        except Exception as e:
-            print(f"\n[КРИТИЧНО] батч упал: {e}. Сохраняем прогресс и выходим.")
-            SCORES_PATH.write_text(json.dumps(scores, ensure_ascii=False, indent=2), encoding="utf-8")
+def poll_batch(client: anthropic.Anthropic, batch_id: str, poll_interval: int = 60) -> None:
+    """Ждёт завершения батча, выводя статус каждые poll_interval секунд."""
+    print(f"Ожидаем завершения батча {batch_id}...")
+    while True:
+        batch = client.messages.batches.retrieve(batch_id)
+        status = batch.processing_status
+        counts = batch.request_counts
+        print(
+            f"  [{time.strftime('%H:%M:%S')}] {status}: "
+            f"processing={counts.processing}, succeeded={counts.succeeded}, "
+            f"errored={counts.errored}"
+        )
+        if status == "ended":
             return
+        time.sleep(poll_interval)
 
-        # Записываем результаты
-        scored_ids = set()
-        for r in results:
+
+def collect_results(
+    client: anthropic.Anthropic,
+    batch_id: str,
+    mini_batches: list[list[dict]],
+    scores: dict,
+) -> int:
+    """Парсит результаты батча, пишет в scores. Возвращает число успешно оценённых цитат."""
+    # Строим lookup: mini_{i} → список item-ов
+    by_idx: dict[int, list[dict]] = {i: mb for i, mb in enumerate(mini_batches)}
+
+    new_scored = 0
+    for result in client.messages.batches.results(batch_id):
+        idx = int(result.custom_id.split("_", 1)[1])
+        mini = by_idx.get(idx, [])
+
+        if result.result.type != "succeeded":
+            err = getattr(result.result, "error", result.result.type)
+            print(f"  [ошибка] mini_{idx}: {err}. Ставим нейтральную оценку 5.")
+            for item in mini:
+                if item["chunk_id"] not in scores:
+                    scores[item["chunk_id"]] = {
+                        "score": 5,
+                        "reason": f"batch error: {err}",
+                        "merge_with_next": False,
+                    }
+            continue
+
+        raw = result.result.message.content[0].text
+        try:
+            parsed = parse_response(raw)
+        except json.JSONDecodeError as e:
+            print(f"  [JSON ошибка] mini_{idx}: {e}. Ставим нейтральную оценку 5.")
+            for item in mini:
+                if item["chunk_id"] not in scores:
+                    scores[item["chunk_id"]] = {
+                        "score": 5,
+                        "reason": "json parse error",
+                        "merge_with_next": False,
+                    }
+            continue
+
+        scored_ids: set[str] = set()
+        for r in parsed:
             cid = r.get("id") or r.get("chunk_id")
             if cid:
                 scores[cid] = {
@@ -193,20 +180,21 @@ def main():
                     "merge_with_next": bool(r.get("merge_with_next", False)),
                 }
                 scored_ids.add(cid)
+                new_scored += 1
 
-        # Если модель не вернула оценку для каких-то цитат — ставим нейтральную 5
-        for item in batch:
+        for item in mini:
             if item["chunk_id"] not in scored_ids:
-                scores[item["chunk_id"]] = {"score": 5, "reason": "нет ответа от модели", "merge_with_next": False}
+                scores[item["chunk_id"]] = {
+                    "score": 5,
+                    "reason": "нет ответа от модели",
+                    "merge_with_next": False,
+                }
 
-        done += len(batch)
-        print(f"OK ({len(results)} оценок)")
+    return new_scored
 
-        # Сохраняем после каждого батча — чтобы не терять прогресс
-        SCORES_PATH.write_text(json.dumps(scores, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(f"\nГотово! Оценено {len(scores)} цитат.")
-    dist = {}
+def print_distribution(scores: dict) -> None:
+    dist: dict[int, int] = {}
     for v in scores.values():
         s = v["score"]
         dist[s] = dist.get(s, 0) + 1
@@ -216,6 +204,113 @@ def main():
         print(f"  {s:2d}: {dist[s]:4d} {bar}")
     merge_count = sum(1 for v in scores.values() if v.get("merge_with_next"))
     print(f"Кандидатов на слияние: {merge_count}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH,
+                        help="Цитат на один LLM-запрос внутри батча")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
+    parser.add_argument("--resume", action="store_true",
+                        help="Продолжить: переиспользовать батч из batch_state.json")
+    parser.add_argument("--poll-interval", type=int, default=60,
+                        help="Интервал опроса статуса батча (секунды)")
+    args = parser.parse_args()
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY не задан в .env")
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    print(f"Читаем датасет: {DATASET_PATH}")
+    df = pd.read_parquet(DATASET_PATH)
+    print(f"Цитат: {len(df)}, треков: {df['track_name'].nunique()}")
+
+    # Загружаем уже посчитанные оценки
+    scores: dict = {}
+    if SCORES_PATH.exists():
+        scores = json.loads(SCORES_PATH.read_text(encoding="utf-8"))
+        if scores:
+            print(f"Загружено существующих оценок: {len(scores)}")
+
+    # Строим lookup «следующая цитата» по треку
+    next_quote: dict[str, dict] = {}
+    for _, group in df.groupby("track_name", sort=False):
+        ids = group["chunk_id"].tolist()
+        texts = group["text"].tolist()
+        for i in range(len(ids) - 1):
+            next_quote[ids[i]] = {"chunk_id": ids[i + 1], "text": texts[i + 1]}
+
+    # Если resume — пробуем подхватить существующий батч
+    state: dict = {}
+    if args.resume and STATE_PATH.exists():
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        print(f"Резьюм: найден batch_id={state.get('batch_id')}")
+
+    if "batch_id" in state and "mini_batches" in state:
+        batch_id = state["batch_id"]
+        mini_batches = state["mini_batches"]
+        print(f"Опрашиваем существующий батч {batch_id}...")
+        poll_batch(client, batch_id, args.poll_interval)
+    else:
+        # Строим мини-батчи только для ещё не оценённых цитат
+        pending = []
+        for row in df.to_dict("records"):
+            if row["chunk_id"] in scores:
+                continue
+            nxt = next_quote.get(row["chunk_id"])
+            pending.append({
+                "chunk_id": row["chunk_id"],
+                "text": row["text"],
+                "has_next": nxt is not None,
+                "next_text": nxt["text"] if nxt else "",
+            })
+
+        total = len(pending)
+        if total == 0:
+            print("Все цитаты уже оценены.")
+            print_distribution(scores)
+            print(f"Результат: {SCORES_PATH}")
+            return
+
+        mini_batches = [
+            pending[i:i + args.batch_size]
+            for i in range(0, total, args.batch_size)
+        ]
+        print(
+            f"К оценке: {total} цитат → {len(mini_batches)} мини-батчей "
+            f"(batch_size={args.batch_size}), модель={args.model}"
+        )
+        print("Отправляем в Anthropic Batches API...")
+
+        batch_id = submit_batch(client, mini_batches, args.model)
+        print(f"Батч создан: {batch_id}")
+
+        # Сохраняем состояние для resume
+        STATE_PATH.write_text(
+            json.dumps({"batch_id": batch_id, "mini_batches": mini_batches},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        poll_batch(client, batch_id, args.poll_interval)
+
+    # Собираем результаты
+    print("Собираем результаты...")
+    new_count = collect_results(client, batch_id, mini_batches, scores)
+
+    # Сохраняем оценки
+    SCORES_PATH.write_text(
+        json.dumps(scores, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # Удаляем файл состояния — батч завершён
+    if STATE_PATH.exists():
+        STATE_PATH.unlink()
+
+    print(f"\nГотово! Оценено {len(scores)} цитат (новых в этом запуске: {new_count}).")
+    print_distribution(scores)
     print(f"Результат: {SCORES_PATH}")
 
 
