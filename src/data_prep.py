@@ -27,6 +27,25 @@ def normalize(text: str) -> str:
     return re.sub(r"[^\w]+", " ", text.lower()).strip()
 
 
+def is_quality_chunk(chunk: str) -> bool:
+    """Отсекает синтаксически незавершённые фрагменты до попадания в базу."""
+    text = chunk.strip()
+
+    # Слишком мало слов
+    if len(text.split()) < 6:
+        return False
+
+    # Заканчивается запятой или двоеточием — фраза явно продолжается дальше
+    if text.rstrip()[-1] in {",", ":"}:
+        return False
+
+    # Артефакт скрапера: «слово ... слово» — обрыв в оригинале
+    if re.search(r"\s\.\.\.\s", text):
+        return False
+
+    return True
+
+
 def chunk_lines(lines: list[str], size: int = LINES_PER_CHUNK) -> list[str]:
     """Режет строки на НЕперекрывающиеся группы по `size` строк.
 
@@ -68,6 +87,8 @@ def process_corpus(input_dir: Path) -> pd.DataFrame:
         for idx, chunk in enumerate(chunk_lines(lines)):
             key = normalize(chunk)
             if len(key) < MIN_CHUNK_LEN or key in seen:
+                continue
+            if not is_quality_chunk(chunk):
                 continue
             seen.add(key)
             rows.append({

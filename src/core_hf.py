@@ -14,7 +14,7 @@ from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunct
 
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 COLLECTION_NAME = "krovostok_quotes"
-N_CANDIDATES = 20
+N_CANDIDATES = 30
 
 _PREPOSITIONS = {
     "в", "на", "с", "по", "за", "к", "у", "из", "до", "от", "над",
@@ -42,6 +42,18 @@ def _is_valid(text: str, user_query: str) -> bool:
 
     # Слишком короткий фрагмент
     if len(text) < 12:
+        return False
+
+    # Слишком мало слов — не тянет на цитату
+    if len(text.split()) < 6:
+        return False
+
+    # Заканчивается запятой или двоеточием — фраза не завершена
+    if text.rstrip()[-1] in {",", ":"}:
+        return False
+
+    # Артефакт скрапера: пробел-точки-пробел внутри текста указывает на обрыв оригинала
+    if re.search(r"\s\.\.\.\s", text):
         return False
 
     # Обрывается на предлоге или союзе

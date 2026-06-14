@@ -23,32 +23,38 @@ def main():
     )
 
     print(f"Подключаемся к ChromaDB по пути: {db_path}")
-    # Настраиваем персистентный клиент (данные сохранятся на диск)
     client = chromadb.PersistentClient(path=str(db_path))
 
-    # Создаем или получаем коллекцию (таблицу)
     collection_name = "krovostok_quotes"
-    collection = client.get_or_create_collection(
-        name=collection_name, 
+
+    # Удаляем старую коллекцию, чтобы не оставалось удалённых чанков-зомби.
+    # upsert обновляет существующие записи, но НЕ удаляет те, которых больше нет
+    # в parquet — отсюда дубли в результатах поиска.
+    try:
+        client.delete_collection(name=collection_name)
+        print(f"Удалена старая коллекция '{collection_name}' (чистая пересборка)")
+    except Exception:
+        pass
+
+    collection = client.create_collection(
+        name=collection_name,
         embedding_function=sentence_transformer_ef
     )
 
-    # ChromaDB не любит получать все 837 записей за один раз, разобьем на батчи
     batch_size = 100
     total_batches = (len(df) // batch_size) + 1
 
     print(f"Начинаем векторизацию и загрузку {len(df)} записей в базу...")
-    
+
     for i in range(total_batches):
         start_idx = i * batch_size
         end_idx = start_idx + batch_size
         batch_df = df.iloc[start_idx:end_idx]
-        
+
         if batch_df.empty:
             break
 
-        # Загружаем батч в базу
-        collection.upsert(
+        collection.add(
             documents=batch_df["text"].tolist(),
             metadatas=[{"track_name": track} for track in batch_df["track_name"].tolist()],
             ids=batch_df["chunk_id"].tolist()
