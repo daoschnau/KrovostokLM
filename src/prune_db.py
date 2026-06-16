@@ -7,15 +7,20 @@
 НЕ требует переиндексации — просто удаляет записи из ChromaDB, вектора
 оставшихся цитат уже там есть.
 
-Запуск:
-  python src/prune_db.py                     # оставить топ-500
-  python src/prune_db.py --keep 400          # оставить топ-400
-  python src/prune_db.py --min-score 7       # оставить всё с оценкой >= 7
-  python src/prune_db.py --dry-run           # посмотреть что останется, не трогая файлы
-  python src/prune_db.py --apply-merges      # дополнительно применить слияния
+Рекомендуемый порядок работы:
+  1. python src/prune_db.py --update-metadata   # записать score+valence в ChromaDB (не удалять)
+  2. python src/batch_test.py --min-score 5     # тестировать на разных порогах
+  3. python src/prune_db.py --min-score 5       # физически удалить мусор, когда порог выбран
+
+Остальные флаги:
+  python src/prune_db.py --dry-run              # посмотреть что останется, не трогая файлы
+  python src/prune_db.py --keep 400             # оставить топ-400
+  python src/prune_db.py --dedup                # убрать текстовые дубли
+  python src/prune_db.py --apply-merges         # применить слияния (требует переиндексации)
 """
 import argparse
 import json
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -32,6 +37,22 @@ def load_scores(path: Path) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"scores.json не найден: {path}\nСначала запусти: python src/score_quotes.py")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def find_text_duplicates(df: pd.DataFrame) -> set[str]:
+    """Возвращает set chunk_id записей-дублей (по нормализованному тексту).
+
+    Первое вхождение сохраняется, повторы — в возвращаемый set.
+    """
+    seen: dict[str, str] = {}
+    to_remove: set[str] = set()
+    for _, row in df.iterrows():
+        norm = re.sub(r"[^\w]", "", row["text"].lower())
+        if norm in seen:
+            to_remove.add(row["chunk_id"])
+        else:
+            seen[norm] = row["chunk_id"]
+    return to_remove
 
 
 def select_keepers(df: pd.DataFrame, scores: dict, keep: int | None, min_score: int | None) -> pd.DataFrame:
@@ -68,7 +89,6 @@ def apply_merges(df: pd.DataFrame, scores: dict) -> pd.DataFrame:
         print("Кандидатов на слияние нет.")
         return df
 
-    # Строим lookup по chunk_id → индекс строки
     df = df.reset_index(drop=True)
     id_to_idx = {row["chunk_id"]: i for i, row in df.iterrows()}
 
@@ -82,7 +102,6 @@ def apply_merges(df: pd.DataFrame, scores: dict) -> pd.DataFrame:
         if idx is None:
             continue
 
-        # Найдём следующую запись того же трека
         track = df.at[idx, "track_name"]
         next_candidates = df[(df["track_name"] == track) & (df.index > idx)].head(1)
         if next_candidates.empty:
@@ -105,6 +124,42 @@ def apply_merges(df: pd.DataFrame, scores: dict) -> pd.DataFrame:
     print(f"Слито пар: {len(updates)}, убрано дублей: {len(merged_away)}")
     print("  ⚠️  Применены слияния → нужна полная переиндексация: python src/vectorize.py")
     return df
+
+
+def update_chroma_metadata(df: pd.DataFrame, scores: dict, dry_run: bool) -> None:
+    """Записывает score+valence в метаданные ChromaDB без удаления документов.
+
+    После этого ретривер может фильтровать по where={"score": {"$gte": N}}.
+    """
+    print(f"ChromaDB: обновляем метаданные для {len(df)} документов...")
+    if dry_run:
+        print("  [dry-run] Пропускаем обновление метаданных.")
+        return
+
+    client = chromadb.PersistentClient(path=str(DB_PATH))
+    try:
+        collection = client.get_collection(name=COLLECTION_NAME)
+    except Exception as e:
+        print(f"  ⚠️  ChromaDB недоступна: {e}")
+        return
+
+    batch_size = 200
+    rows = df.to_dict("records")
+    for i in range(0, len(rows), batch_size):
+        chunk = rows[i:i + batch_size]
+        ids = [r["chunk_id"] for r in chunk]
+        metadatas = [
+            {
+                "track_name": r["track_name"],
+                "score": int(scores.get(r["chunk_id"], {}).get("score", 5)),
+                "valence": scores.get(r["chunk_id"], {}).get("valence", "нейтрал"),
+            }
+            for r in chunk
+        ]
+        collection.update(ids=ids, metadatas=metadatas)
+        print(f"  обновлено {min(i + batch_size, len(rows))}/{len(rows)}")
+
+    print(f"  ✅ Метаданные обновлены. Теперь можно фильтровать по score в ретривере.")
 
 
 def update_chroma(keepers_df: pd.DataFrame, all_ids: list[str], dry_run: bool) -> None:
@@ -140,11 +195,22 @@ def print_stats(df: pd.DataFrame, scores: dict) -> None:
     print("\n=== Топ-20 цитат по оценке ===")
     top = df.nlargest(20, "score")
     for _, row in top.iterrows():
-        reason = scores.get(row["chunk_id"], {}).get("reason", "")
+        info = scores.get(row["chunk_id"], {})
+        reason = info.get("reason", "")
+        valence = info.get("valence", "")
         preview = row["text"].replace("\n", " / ")[:80]
-        print(f"  [{row['score']:2d}] {preview}")
+        valence_tag = f" [{valence}]" if valence else ""
+        print(f"  [{row['score']:2d}]{valence_tag} {preview}")
         if reason:
             print(f"       ↳ {reason[:100]}")
+
+    print("\n=== Распределение тональности ===")
+    valence_counts: dict[str, int] = {}
+    for cid in df["chunk_id"]:
+        v = scores.get(cid, {}).get("valence", "нет данных")
+        valence_counts[v] = valence_counts.get(v, 0) + 1
+    for v, cnt in sorted(valence_counts.items(), key=lambda x: -x[1]):
+        print(f"  {v}: {cnt}")
 
     print("\n=== Треки после фильтрации ===")
     tc = df.groupby("track_name").size().sort_values(ascending=False)
@@ -158,11 +224,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--keep", type=int, default=500, help="Сколько лучших цитат оставить (0 = не ограничивать)")
     parser.add_argument("--min-score", type=int, default=None, help="Минимальная оценка для попадания в базу")
+    parser.add_argument("--update-metadata", action="store_true",
+                        help="Записать score+valence в ChromaDB без удаления — для тестирования порогов")
+    parser.add_argument("--dedup", action="store_true", help="Убрать текстовые дубли")
     parser.add_argument("--apply-merges", action="store_true", help="Применить слияния (требует переиндексации)")
     parser.add_argument("--dry-run", action="store_true", help="Показать что получится, не изменяя файлы")
     args = parser.parse_args()
-
-    keep = args.keep if args.keep > 0 else None
 
     print(f"Читаем датасет: {DATASET_PATH}")
     df = pd.read_parquet(DATASET_PATH)
@@ -173,6 +240,27 @@ def main():
     scores = load_scores(SCORES_PATH)
     scored_count = sum(1 for cid in all_ids if cid in scores)
     print(f"Оценено: {scored_count}/{len(df)}")
+
+    # Режим --update-metadata: просто пишем метаданные и выходим
+    if args.update_metadata:
+        df_with_scores = df.copy()
+        df_with_scores["score"] = df_with_scores["chunk_id"].map(
+            lambda cid: scores.get(cid, {}).get("score", 5)
+        )
+        update_chroma_metadata(df_with_scores, scores, dry_run=args.dry_run)
+        return
+
+    # Дедупликация по тексту
+    if args.dedup:
+        dupes = find_text_duplicates(df)
+        if dupes:
+            print(f"Текстовых дублей: {len(dupes)} — убираем")
+            df = df[~df["chunk_id"].isin(dupes)].reset_index(drop=True)
+            all_ids = df["chunk_id"].tolist()
+        else:
+            print("Текстовых дублей не найдено.")
+
+    keep = args.keep if args.keep > 0 else None
 
     # Отбор
     keepers_df = select_keepers(df, scores, keep=keep, min_score=args.min_score)

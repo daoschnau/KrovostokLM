@@ -69,6 +69,10 @@ def main():
         default="hf",
         help="hf — чистый retrieval; groq — e5 + HyDE + реранкинг на Groq",
     )
+    parser.add_argument(
+        "--min-score", type=int, default=0,
+        help="Фильтровать ChromaDB по score >= N (требует prune_db.py --update-metadata)",
+    )
     args = parser.parse_args()
 
     # Импортируем выбранный бэкенд лениво (groq тянет API-ключ только при выборе)
@@ -105,6 +109,7 @@ def main():
     lines.append(f"Дата:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"Бэкенд:  {args.backend}")
     lines.append(f"Эмбеддер:{embedding_model}")
+    lines.append(f"min_score: {args.min_score if args.min_score else 'нет'}")
     lines.append(f"Запросы: {queries_path}")
     lines.append(f"Всего:   {len(items)}")
     lines.append("=" * 70)
@@ -120,7 +125,7 @@ def main():
 
         print(f"[{num}/{len(items)}] {text[:50]}...")
         try:
-            result = find_quote(text)
+            result = find_quote(text, min_score=args.min_score)
             quote = result["quote"]
             track = result["track"]
         except Exception as exc:

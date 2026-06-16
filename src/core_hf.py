@@ -143,12 +143,15 @@ def retrieve_candidates(
     embed_text: str,
     filter_against: str | None = None,
     n: int = N_CANDIDATES,
+    min_score: int = 0,
 ) -> list:
     """Достаёт топ-N кандидатов из ChromaDB по тексту embed_text.
 
     embed_text     — текст, который векторизуется для поиска (запрос или HyDE-гипотеза).
     filter_against — текст пользователя, против которого проверяется эвристика
                      валидности (если None — берётся embed_text).
+    min_score      — фильтр по метаданным ChromaDB (требует предварительного
+                     запуска prune_db.py --update-metadata). 0 = без фильтра.
     Возвращает список dict: {id, quote, track, distance, valid}.
     """
     if filter_against is None:
@@ -156,7 +159,12 @@ def retrieve_candidates(
 
     collection = _get_collection()
     query_embedding = embed_query(embed_text)
-    results = collection.query(query_embeddings=[query_embedding], n_results=n)
+
+    where = {"score": {"$gte": min_score}} if min_score > 0 else None
+    query_kwargs: dict = {"query_embeddings": [query_embedding], "n_results": n}
+    if where:
+        query_kwargs["where"] = where
+    results = collection.query(**query_kwargs)
 
     docs = results["documents"][0]
     metas = results["metadatas"][0]
@@ -174,12 +182,13 @@ def retrieve_candidates(
     return candidates
 
 
-def find_quote(user_message: str) -> dict:
+def find_quote(user_message: str, min_score: int = 0) -> dict:
     """Находит цитату по запросу пользователя без использования LLM.
 
+    min_score — фильтровать по score в ChromaDB (0 = без фильтра).
     Возвращает dict с ключами 'quote' и 'track'.
     """
-    candidates = retrieve_candidates(user_message)
+    candidates = retrieve_candidates(user_message, min_score=min_score)
 
     print(f"\n[HF-DIRECT] Запрос: {user_message}")
     print("[HF-DIRECT] Топ-3 из ChromaDB (расстояния):")

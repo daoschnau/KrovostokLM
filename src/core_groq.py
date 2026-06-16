@@ -236,7 +236,7 @@ def rerank_quotes(user_query: str, candidates: list) -> dict | None:
         return None
 
 
-def find_quote(user_message: str, session_id: str = "_global") -> dict:
+def find_quote(user_message: str, session_id: str = "_global", min_score: int = 0) -> dict:
     """Главный пайплайн. Никогда не бросает исключений: при любом сбое Groq
     деградирует в чистый e5-retrieval.
 
@@ -263,6 +263,7 @@ def find_quote(user_message: str, session_id: str = "_global") -> dict:
         embed_text=embed_text,
         filter_against=user_message,
         n=N_CANDIDATES,
+        min_score=min_score,
     )
     valid = [c for c in candidates if c["valid"]] or candidates
 
