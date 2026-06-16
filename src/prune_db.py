@@ -222,7 +222,7 @@ def print_stats(df: pd.DataFrame, scores: dict) -> None:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--keep", type=int, default=500, help="Сколько лучших цитат оставить (0 = не ограничивать)")
+    parser.add_argument("--keep", type=int, default=0, help="Сколько лучших цитат оставить (0 = не ограничивать)")
     parser.add_argument("--min-score", type=int, default=None, help="Минимальная оценка для попадания в базу")
     parser.add_argument("--update-metadata", action="store_true",
                         help="Записать score+valence в ChromaDB без удаления — для тестирования порогов")
