@@ -20,8 +20,9 @@
       Groq, отвечая мгновенно на сыром e5 (без лишней латентности под нагрузкой);
     • кэш одинаковых запросов экономит бюджет на повторах.
 
-Модель: llama-3.3-70b-versatile (качество). Для публичного бота имеет смысл
-        GROQ_MODEL=llama-3.1-8b-instant — слабее, но ~5x дневной бюджет.
+Модель: llama-3.3-70b-versatile (качество), переопределяется через GROQ_MODEL.
+        Если заданная модель снята с Groq (404 model_not_found), пайплайн один
+        раз переключается на DEFAULT_GROQ_MODEL и дальше работает на ней.
 Ключ:   GROQ_API_KEY в .env
 """
 import os
@@ -33,7 +34,7 @@ from collections import deque
 from pathlib import Path
 
 from dotenv import load_dotenv
-from groq import Groq, RateLimitError
+from groq import Groq, NotFoundError, RateLimitError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -41,7 +42,8 @@ from core_hf import retrieve_candidates, EMBEDDING_MODEL  # noqa: E402
 
 load_dotenv()
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = os.getenv("GROQ_MODEL") or DEFAULT_GROQ_MODEL
 USE_HYDE = os.getenv("USE_HYDE", "true").lower() not in {"false", "0", "no"}
 RATE_LIMIT_COOLDOWN = int(os.getenv("GROQ_COOLDOWN_SEC", "120"))
 
@@ -163,8 +165,7 @@ def generate_hyde(user_query: str) -> str | None:
         "Пример позитив: 'Чемпион — не тот, кто не падал, а тот, кто вставал быстрее всех.'"
     )
     try:
-        response = _get_client().chat.completions.create(
-            model=GROQ_MODEL,
+        response = _chat_completion(
             max_tokens=80,
             temperature=0.8,
             messages=[
@@ -180,6 +181,20 @@ def generate_hyde(user_query: str) -> str | None:
     except Exception as e:
         print(f"[ОШИБКА HyDE] {e}")
         return None
+
+
+def _chat_completion(**kwargs):
+    """chat.completions.create с фоллбэком: если GROQ_MODEL снята с Groq (404),
+    переключаемся на DEFAULT_GROQ_MODEL до конца жизни процесса."""
+    global GROQ_MODEL
+    try:
+        return _get_client().chat.completions.create(model=GROQ_MODEL, **kwargs)
+    except NotFoundError:
+        if GROQ_MODEL == DEFAULT_GROQ_MODEL:
+            raise
+        print(f"[GROQ] Модель {GROQ_MODEL} недоступна, переключаюсь на {DEFAULT_GROQ_MODEL}")
+        GROQ_MODEL = DEFAULT_GROQ_MODEL
+        return _get_client().chat.completions.create(model=GROQ_MODEL, **kwargs)
 
 
 def rerank_quotes(user_query: str, candidates: list) -> dict | None:
@@ -211,8 +226,7 @@ def rerank_quotes(user_query: str, candidates: list) -> dict | None:
         "Ответь строго: ЗНАК: <позитив/негатив>  ОТВЕТ: [номер]"
     )
     try:
-        response = _get_client().chat.completions.create(
-            model=GROQ_MODEL,
+        response = _chat_completion(
             max_tokens=40,
             temperature=0.0,
             messages=[{"role": "user", "content": prompt}],
