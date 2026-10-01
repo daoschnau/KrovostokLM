@@ -29,7 +29,7 @@ RAG-пайплайн с одноплечим HyDE и LLM-реранкингом.
         │
         ▼
 [2] Векторный поиск — гипотеза векторизуется через DeepInfra (e5-large)
-    → ChromaDB → топ-12 похожих цитат из ~1 200 чанков текстов
+    → ChromaDB → топ-12 похожих цитат из ~620 отобранных двустиший
         │
         ▼
 [3] Реранкинг — Groq выбирает одну цитату по правилам:
@@ -46,7 +46,7 @@ RAG-пайплайн с одноплечим HyDE и LLM-реранкингом.
 Ответ в Telegram (aiogram, long polling)
 ```
 
-**Устойчивость к сбоям.** Groq free tier ограничен дневным бюджетом токенов. При любом сбое или rate-limit бот не падает: включается cooldown и до его истечения ответы идут напрямую с лучшего e5-кандидата (без LLM, мгновенно). Повторные одинаковые запросы кэшируются — бюджет расходуется только на уникальные ситуации.
+**Устойчивость к сбоям.** Groq free tier ограничен дневным бюджетом токенов. При любом сбое или rate-limit бот не падает: включается cooldown и до его истечения ответы идут напрямую с лучшего e5-кандидата (без LLM, мгновенно). Повторные одинаковые запросы кэшируются — бюджет расходуется только на уникальные ситуации. Если модель из `GROQ_MODEL` снята с Groq (404), бот сам переключается на `llama-3.3-70b-versatile`.
 
 ## Стек
 
@@ -56,6 +56,7 @@ RAG-пайплайн с одноплечим HyDE и LLM-реранкингом.
 | LLM — HyDE и реранкинг | Groq API (`llama-3.3-70b-versatile`), бесплатно |
 | Эмбеддинги | `intfloat/multilingual-e5-large` через [DeepInfra API](https://deepinfra.com/) |
 | Векторная база | [ChromaDB](https://www.trychroma.com/) (persistent, 1024-мер, в репозитории) |
+| Отбор цитат (офлайн, разово) | Claude Haiku через Anthropic Batches API |
 | Деплой | Docker → [Render](https://render.com/) (Background Worker) |
 
 ## Структура проекта
@@ -64,8 +65,10 @@ RAG-пайплайн с одноплечим HyDE и LLM-реранкингом.
 KrovostokLM/
 ├── data/
 │   ├── raw/                 # Сырые тексты песен (.txt), один файл — один трек
-│   ├── processed/           # dataset.parquet — нарезанные чанки (~1 200 двустиший)
-│   └── vector_db/           # Готовая база ChromaDB (1024-мер, e5-large)
+│   ├── processed/           # dataset.parquet — двустишия (после отбора ~620)
+│   ├── vector_db/           # Готовая база ChromaDB (1024-мер, e5-large)
+│   ├── scores.json          # Оценки качества цитат (1–10) от Claude
+│   └── test_queries.txt     # 30 тестовых сценариев (8 эмоциональных категорий)
 ├── src/
 │   ├── bot.py               # Telegram-бот, точка входа
 │   ├── core_groq.py         # Главный пайплайн: HyDE → поиск → реранкинг → анти-магнит
@@ -73,8 +76,11 @@ KrovostokLM/
 │   ├── batch_test.py        # Батч-прогон тестовых запросов, --backend hf|groq
 │   ├── vectorize.py         # Пересборка базы (DeepInfra API или локальная модель)
 │   ├── data_prep.py         # Чанкование: sliding window по 2 строки
-│   └── scrape_lyrics.py     # Скрейпер текстов
-├── data/test_queries.txt    # 30 тестовых сценариев (8 эмоциональных категорий)
+│   ├── scrape_lyrics.py     # Скрейпер текстов
+│   ├── score_quotes.py      # Оценка качества цитат через Anthropic Batches API
+│   ├── prune_db.py          # Отбор по оценке + дедуп, чистит dataset и ChromaDB
+│   ├── cli.py               # Локальный CLI для чистого retrieval (core_hf)
+│   └── core.py              # Legacy: ранний пайплайн на Claude, ботом не используется
 ├── docker-compose.yml
 ├── Dockerfile
 ├── requirements.txt         # Рантайм: aiogram, chromadb, groq, requests
@@ -92,6 +98,7 @@ KrovostokLM/
 TG_BOT_TOKEN=...           # токен бота от @BotFather
 GROQ_API_KEY=...           # бесплатно на console.groq.com/keys
 DEEPINFRA_API_KEY=...      # deepinfra.com/dash/api_keys (нужна карта, трата — центы)
+ANTHROPIC_API_KEY=...      # только для score_quotes.py (пересборка базы), боту не нужен
 ```
 
 Опциональные переменные описаны в `.env.example`.
@@ -124,7 +131,11 @@ docker compose logs -f
 python src/scrape_lyrics.py   # собрать тексты в data/raw/
 python src/data_prep.py       # нарезать на двустишия → data/processed/dataset.parquet
 python src/vectorize.py       # векторизовать через DeepInfra → data/vector_db/
+python src/score_quotes.py    # оценить цитаты Claude'ом → data/scores.json
+python src/prune_db.py --min-score 5 --dedup   # оставить score ≥ 5, убрать дубли
 ```
+
+`vectorize.py` пересобирает базу из всего корпуса (~1 200 двустиший), поэтому без двух последних шагов отбор теряется. Порог удобно подобрать заранее: `prune_db.py --update-metadata` пишет оценки в метаданные ChromaDB, не удаляя записи, и `batch_test.py --min-score N` гоняет тесты с фильтром.
 
 После этого закоммить `data/vector_db` и запушить — деплой подхватит.
 

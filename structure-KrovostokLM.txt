@@ -1,15 +1,30 @@
-krovostok_lm/
+KrovostokLM/
 ├── data/
-│   ├── raw/                 # Сырые .txt файлы с текстами песен
-│   ├── processed/           # Готовые датасеты (.csv, .parquet)
-│   └── vector_db/           # Директория для индексов FAISS/ChromaDB
+│   ├── raw/                     # Сырые тексты песен (.txt), один файл — один трек (82 трека)
+│   ├── processed/
+│   │   └── dataset.parquet      # Двустишия после отбора (~620 цитат)
+│   ├── vector_db/               # ChromaDB (persistent, e5-large, 1024-мер), коммитится в репозиторий
+│   ├── scores.json              # Оценки качества цитат (1–10) от Claude
+│   └── test_queries.txt         # 30 тестовых сценариев (8 эмоциональных категорий)
 ├── src/
-│   ├── __init__.py
-│   ├── data_prep.py         # Скрипт парсинга и очистки
-│   ├── vectorize.py         # Скрипт создания эмбеддингов
-│   ├── core.py              # LLM + HyDE логика (RAG)
-│   └── bot.py               # Точка входа для Telegram (aiogram)
-├── .env                     # API ключи (LLM, Telegram) - НЕ КОММИТИТЬ
-├── .gitignore               # Исключения для Git
-├── requirements.txt         # Зависимости
-└── README.md                # Описание проекта
+│   ├── bot.py                   # Точка входа: Telegram-бот (aiogram 3, long polling)
+│   ├── core_groq.py             # Основной пайплайн: HyDE → поиск → реранкинг → анти-магнит (Groq)
+│   ├── core_hf.py               # Retrieval-ядро: эмбеддинг (DeepInfra / local) + ChromaDB
+│   ├── core.py                  # Legacy: ранний пайплайн на Claude, ботом не используется
+│   ├── cli.py                   # Локальный CLI для чистого retrieval (core_hf)
+│   ├── batch_test.py            # Батч-прогон data/test_queries.txt, --backend hf|groq, --min-score
+│   ├── scrape_lyrics.py         # Скрейпер текстов → data/raw/
+│   ├── data_prep.py             # Чанкование: sliding window по 2 строки → dataset.parquet
+│   ├── vectorize.py             # Векторизация корпуса → data/vector_db/ (DeepInfra или локально)
+│   ├── score_quotes.py          # Оценка цитат через Anthropic Batches API → data/scores.json
+│   └── prune_db.py              # Отбор по оценке (--min-score) + дедуп, чистит dataset и ChromaDB
+├── .env                         # Ключи (TG_BOT_TOKEN, GROQ_API_KEY, DEEPINFRA_API_KEY, ANTHROPIC_API_KEY) — НЕ КОММИТИТЬ
+├── .env.example                 # Шаблон переменных окружения
+├── .gitignore
+├── .dockerignore
+├── Dockerfile                   # Образ для Render / Docker Compose
+├── docker-compose.yml
+├── requirements.txt             # Рантайм: aiogram, chromadb, groq, requests
+├── requirements-local.txt       # Дев: + sentence-transformers, pandas, pyarrow, anthropic
+├── structure-KrovostokLM.txt    # Этот файл
+└── README.md
